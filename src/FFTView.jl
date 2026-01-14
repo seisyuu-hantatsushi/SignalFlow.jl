@@ -53,6 +53,7 @@ mutable struct ViewContext{T} <: SignalFlowBlock
     idx_lo::Int
     idx_hi::Int
     yobs::Observable{Vector{Float64}}
+    fig::Figure
     screen::Union{Nothing, GLMakie.Screen}
     freq_view::Vector{Float64}
     main_task::Union{Nothing,Task}
@@ -171,7 +172,7 @@ function CreateView(::Type{T}, inputSamplingRate::UInt64, numberOfFFTSampling::U
         end
     end
 
-    screen = GLMakie.Screen(fig.scene; renderloop = renderloop)
+    screen = GLMakie.Screen(; renderloop = renderloop)
     display(screen, fig)
     if screen !== nothing
         GLMakie.set_title!(screen, title)
@@ -188,6 +189,7 @@ function CreateView(::Type{T}, inputSamplingRate::UInt64, numberOfFFTSampling::U
                        idx_lo,
                        idx_hi,
                        yobs,
+                       fig,
                        screen,
                        freq_view,
                        main_task,
