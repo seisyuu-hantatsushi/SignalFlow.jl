@@ -15,6 +15,7 @@ mutable struct LPF{T,F} <: SignalFlowBlock
     running::Base.Threads.Atomic{Bool}
     filter_type::FilterType
     filter::F
+    decimation::Int
     outbuf::Vector{T}
     freeQ::Channel{Vector{T}}
     fullQ::Channel{Vector{T}}
@@ -48,12 +49,15 @@ function CreateLPF(::Type{T}, samplerate::Real, cutoff::Real;
                    transitionwidth::Real = cutoff * 0.1,
                    attenuation::Real = 60.0,
                    iir_order::Int = 4,
-                   poolsize::Int = 8) where {T}
+                   poolsize::Int = 8,
+                   decimation::Int = 1) where {T}
 
     samplerate <= 0 && error("samplerate must be positive.")
     cutoff <= 0 && error("cutoff must be positive.")
     cutoff >= samplerate / 2 && error("cutoff must be less than Nyquist.")
     poolsize < 1 && error("poolsize must be at least 1.")
+    decimation < 1 && error("decimation must be >= 1.")
+    cutoff >= samplerate / (2 * decimation) && error("cutoff must be less than Nyquist after decimation.")
 
     filter = if filter_type == FIR
         transitionwidth <= 0 && error("transitionwidth must be positive.")
@@ -80,6 +84,7 @@ function CreateLPF(::Type{T}, samplerate::Real, cutoff::Real;
     lpf = LPF(Base.Threads.Atomic{Bool}(true),
               filter_type,
               filter,
+              decimation,
               outbuf,
               freeQ,
               fullQ,
@@ -102,6 +107,18 @@ function task!(context::LPF{T}) where {T}
                     end
                     out = view(context.outbuf, 1:actual_size)
                     DSP.filt!(out, context.filter, buf)
+
+                    if context.decimation > 1
+                        out_size = (actual_size - 1) ÷ context.decimation + 1
+                        write_pos = 1
+                        read_pos = 1
+                        @inbounds while read_pos <= actual_size
+                            context.outbuf[write_pos] = context.outbuf[read_pos]
+                            write_pos += 1
+                            read_pos += context.decimation
+                        end
+                        actual_size = out_size
+                    end
 
                     while isready(context.new_sinks)
                         push!(context.sinks, take!(context.new_sinks))
