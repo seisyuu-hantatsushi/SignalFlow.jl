@@ -6,6 +6,7 @@ function input! end
 include("ADFMCOMMS2Src.jl")
 include("RingBuffers.jl")
 include("WBFMStereoDemod.jl")
+include("AlsaSink.jl")
 include("WavSink.jl")
 include("WaveformView.jl")
 include("FFTView.jl")
