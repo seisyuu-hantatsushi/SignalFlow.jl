@@ -65,7 +65,7 @@ function task!(context::ADFMCOMMS2Src)
 
             recv_size = ADFMCOMMS2.recv!(context.adapter, recv_buffer)
             if recv_size < 0
-                error("RF Receive Error")
+                error("ADFMCOMMS2Src: RF Receive Error")
             end
             total_recv_samples += recv_size
 
@@ -87,7 +87,7 @@ function task!(context::ADFMCOMMS2Src)
         end
         
     catch e
-        println(e)
+        println("ADFMCOMMS2Src error: ", e)
     end
     ADFMCOMMS2.stop!(context.adapter)
 end
