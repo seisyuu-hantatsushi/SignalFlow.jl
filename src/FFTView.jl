@@ -59,9 +59,9 @@ mutable struct ViewContext{T} <: SignalFlowBlock
     main_task::Union{Nothing,Task}
     worker::Union{Nothing,Task}
     update_task::Union{Nothing,Task}
-    ringbuffer::RingFrameBuffer{T}   
+    signal_datas::RingFrameBuffer{T}   
     holdbuf::Union{Nothing, Int}
-    resultQ::Channel{Vector{Float64}}
+    result_ringbuffer::RingFrameBuffer{Float64}
 end
 
 function hann_window_coeffs(ns::UnitRange{Int}, denom)
@@ -118,7 +118,14 @@ function process_samples!(context::ViewContext{ComplexF32}, samples::AbstractVec
             spec = abs.(fft(context.tmp))
             spec = fftshift(spec)
             spec_db = 20 .* log10.(spec ./ fft_size .+ eps(Float32))
-            put!(context.resultQ, Float64.(spec_db[context.idx_lo:context.idx_hi]))
+            if isready(context.result_ringbuffer.freeQ)
+                result_index = take!(context.result_ringbuffer.freeQ)
+                result_buf = context.result_ringbuffer.bufs[result_index].buf
+                @inbounds for k in 1:length(result_buf)
+                    result_buf[k] = Float64(spec_db[context.idx_lo + k - 1])
+                end
+                put!(context.result_ringbuffer.fullQ, result_index)
+            end
             context.fft_pos = 1
         end
     end
@@ -178,7 +185,7 @@ function CreateView(::Type{T}, inputSamplingRate::UInt64, numberOfFFTSampling::U
         GLMakie.set_title!(screen, title)
     end
 
-    resultQ = Channel{Vector{Float64}}(poolsize)
+    result_ringbuffer = RingFrameBuffer(Float64, length(freq_view), poolsize)
     
     view = ViewContext(Base.Threads.Atomic{Bool}(true),
                        Parameter(inputSamplingRate, window),
@@ -197,7 +204,7 @@ function CreateView(::Type{T}, inputSamplingRate::UInt64, numberOfFFTSampling::U
                        nothing,
                        RingFrameBuffer(T, fft_size, poolsize),
                        nothing,
-                       resultQ)
+                       result_ringbuffer)
     view.update_task = @async update_task!(view)
     view.worker = Threads.@spawn task!(view)
     return view
@@ -214,12 +221,12 @@ function task!(context::ViewContext{T}) where {T}
                 context.running[] = false
                 break
             end
-            if isready(context.ringbuffer.fullQ)
-                rd_index = take!(context.ringbuffer.fullQ)
-                rd_buffer = context.ringbuffer.bufs[rd_index]
+            if isready(context.signal_datas.fullQ)
+                rd_index = take!(context.signal_datas.fullQ)
+                rd_buffer = context.signal_datas.bufs[rd_index]
                 process_samples!(context, rd_buffer.buf, rd_buffer.store_size)
                 rd_buffer.store_size = 0
-                put!(context.ringbuffer.freeQ, rd_index)
+                put!(context.signal_datas.freeQ, rd_index)
             else
                 yield()
             end
@@ -235,8 +242,12 @@ end
 function update_task!(context::ViewContext{T}) where{T}
     try
         while context.running[]
-            if isready(context.resultQ)
-                context.yobs[] = take!(context.resultQ)
+            if isready(context.result_ringbuffer.fullQ)
+                result_index = take!(context.result_ringbuffer.fullQ)
+                result_buf = context.result_ringbuffer.bufs[result_index].buf
+                copyto!(context.yobs[], result_buf)
+                Base.notify(context.yobs)
+                put!(context.result_ringbuffer.freeQ, result_index)
             else
                 yield()
             end
@@ -261,20 +272,20 @@ function input!(context::ViewContext{T}, samples::AbstractVector{T}, samples_siz
     remain_size = actual_size
 
     while remain_size > 0
-        if context.holdbuf == nothing && isready(context.ringbuffer.freeQ)
-            context.holdbuf = take!(context.ringbuffer.freeQ)
+        if context.holdbuf == nothing && isready(context.signal_datas.freeQ)
+            context.holdbuf = take!(context.signal_datas.freeQ)
         end
 
         if context.holdbuf == nothing
             return -1
         else
-            write_frame = context.ringbuffer.bufs[context.holdbuf]
-            copy_size = min(remain_size, context.ringbuffer.frame_size - write_frame.store_size)
+            write_frame = context.signal_datas.bufs[context.holdbuf]
+            copy_size = min(remain_size, context.signal_datas.frame_size - write_frame.store_size)
             copyto!(write_frame.buf, write_frame.store_size + 1, samples, actual_size-remain_size+1, copy_size)
             write_frame.store_size += copy_size
             remain_size -= copy_size
-            if write_frame.store_size >= context.ringbuffer.frame_size
-                put!(context.ringbuffer.fullQ, context.holdbuf)
+            if write_frame.store_size >= context.signal_datas.frame_size
+                put!(context.signal_datas.fullQ, context.holdbuf)
                 context.holdbuf = nothing
             end
         end
