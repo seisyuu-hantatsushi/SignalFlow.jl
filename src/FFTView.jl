@@ -3,6 +3,7 @@ module FFTView
 
 import ..SignalFlowBlock
 import ..input!
+import ..RingBuffers: FrameBuffer, RingFrameBuffer
 
 using FFTW
 using GLMakie
@@ -16,31 +17,6 @@ end
 mutable struct Parameter
     inputSamplingRate::UInt64
     window::WindowFunctions
-end
-
-mutable struct FrameBuffer{T}
-    store_size::Int
-    buf::Vector{T}
-end
-
-function FrameBuffer(::Type{T}, frame_size::Int) where {T}
-    return FrameBuffer(0, Vector{T}(undef, frame_size))
-end
-
-mutable struct RingFrameBuffer{T}
-    frame_size::Int
-    bufs::Vector{FrameBuffer{T}}
-    freeQ::Channel{Int}
-    fullQ::Channel{Int}
-end
-
-function RingFrameBuffer(::Type{T}, frame_size::Int, poolsize::Int) where {T}
-    freeQ = Channel{Int}(poolsize)
-    fullQ = Channel{Int}(poolsize)
-    for i in 1:poolsize
-        put!(freeQ, i)
-    end
-    return RingFrameBuffer(frame_size, [FrameBuffer(T, frame_size) for _ in 1:poolsize], freeQ, fullQ)
 end
 
 mutable struct ViewContext{T} <: SignalFlowBlock
@@ -132,6 +108,35 @@ function process_samples!(context::ViewContext{ComplexF32}, samples::AbstractVec
     return nothing
 end
 
+function process_samples!(context::ViewContext{Float32}, samples::AbstractVector{Float32}, n::Integer)
+    i = 1
+    fft_size = length(context.fft_buf)
+    while i <= n
+        to_copy = min(fft_size - context.fft_pos + 1, n - i + 1)
+        copyto!(context.fft_buf, context.fft_pos, samples, i, to_copy)
+        context.fft_pos += to_copy
+        i += to_copy
+        if context.fft_pos > fft_size
+            @inbounds for k in 1:fft_size
+                context.tmp[k] = ComplexF32(context.fft_buf[k] * context.win[k], 0f0)
+            end
+            spec = abs.(fft(context.tmp))
+            spec = fftshift(spec)
+            spec_db = 20 .* log10.(spec ./ fft_size .+ eps(Float32))
+            if isready(context.result_ringbuffer.freeQ)
+                result_index = take!(context.result_ringbuffer.freeQ)
+                result_buf = context.result_ringbuffer.bufs[result_index].buf
+                @inbounds for k in 1:length(result_buf)
+                    result_buf[k] = Float64(spec_db[context.idx_lo + k - 1])
+                end
+                put!(context.result_ringbuffer.fullQ, result_index)
+            end
+            context.fft_pos = 1
+        end
+    end
+    return nothing
+end
+
 function CreateView(::Type{T}, inputSamplingRate::UInt64, numberOfFFTSampling::UInt64, window::WindowFunctions;
                     frame_size::Int = Int(numberOfFFTSampling),
                     poolsize::Int = 16,
@@ -141,15 +146,15 @@ function CreateView(::Type{T}, inputSamplingRate::UInt64, numberOfFFTSampling::U
                     window_size = (900, 480)) where {T}
 
     fft_size = Int(numberOfFFTSampling)
-    fft_size < 2 && error("FFT size must be at least 2.")
-    fmin >= fmax && error("Frequency range must satisfy fmin < fmax.")
-    frame_size < 1 && error("Frame size must be at least 1.")
-    poolsize < 1 && error("Pool size must be at least 1.")
+    fft_size < 2 && error("FFTView: FFT size must be at least 2.")
+    fmin >= fmax && error("FFTView: Frequency range must satisfy fmin < fmax.")
+    frame_size < 1 && error("FFTView: Frame size must be at least 1.")
+    poolsize < 1 && error("FFTView: Pool size must be at least 1.")
 
     freqs = range(-Float64(inputSamplingRate) / 2, Float64(inputSamplingRate) / 2; length = Int(fft_size))
     idx_lo = max(1, searchsortedfirst(freqs, fmin))
     idx_hi = min(fft_size, searchsortedlast(freqs, fmax))
-    idx_lo > idx_hi && error("Frequency range does not intersect FFT span.")
+    idx_lo > idx_hi && error("FFTView: Frequency range does not intersect FFT span.")
     freq_view = collect(freqs[idx_lo:idx_hi])
 
     fig = Figure(size = window_size)
@@ -233,7 +238,7 @@ function task!(context::ViewContext{T}) where {T}
         end
     catch e
         if !(e isa InterruptException)
-            println(e)
+            println("FFTView task error: ", e)
         end
     end
     return nothing
@@ -254,7 +259,7 @@ function update_task!(context::ViewContext{T}) where{T}
         end
     catch e
         if !(e isa InterruptException)
-            println(e)
+            println("FFTView update error: ", e)
         end
     end
     return nothing
