@@ -1,9 +1,20 @@
-name = "SingalFlow"
+name = "SignalFlow"
 uuid = "6b07fabd-3b26-4d5c-afe2-6f24c7bce15b"
-authors = ["TANIGUCHI, Kazushige <taniguchi.kazushige@gmail.com>"]
 version = "1.0.0-DEV"
+authors = ["TANIGUCHI, Kazushige <taniguchi.kazushige@gmail.com>"]
+
+[deps]
+ADFMCOMMS2 = "c4281f09-985f-44f9-b7bb-ee6f15283c25"
+DSP = "717857b8-e6f2-59f4-9121-6e50c889abd2"
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+GLMakie = "e9467ef8-e4e7-5192-8a1a-b1aee30e663a"
+Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
 
 [compat]
+ADFMCOMMS2 = "0.0.1"
+DSP = "0.8.4"
+FFTW = "1.8"
+GLMakie = "0.11"
 julia = "1.12"
 
 [extras]
