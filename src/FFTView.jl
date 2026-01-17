@@ -26,6 +26,10 @@ mutable struct ViewContext{T} <: SignalFlowBlock
     fft_pos::Int
     win::Vector{Float32}
     tmp::Vector{ComplexF32}
+    avg_enabled::Bool
+    avg_time_s::Float64
+    avg_alpha::Float64
+    avg_power::Vector{Float64}
     idx_lo::Int
     idx_hi::Int
     yobs::Observable{Vector{Float64}}
@@ -94,6 +98,14 @@ function process_samples!(context::ViewContext{ComplexF32}, samples::AbstractVec
             spec = abs.(fft(context.tmp))
             spec = fftshift(spec)
             spec_db = 20 .* log10.(spec ./ fft_size .+ eps(Float32))
+            if context.avg_enabled
+                @inbounds for k in 1:fft_size
+                    a = Float64(spec[k]) / fft_size
+                    p = a * a
+                    context.avg_power[k] += context.avg_alpha * (p - context.avg_power[k])
+                    spec_db[k] = 10 .* log10(context.avg_power[k] + eps(Float64))
+                end
+            end
             if isready(context.result_ringbuffer.freeQ)
                 result_index = take!(context.result_ringbuffer.freeQ)
                 result_buf = context.result_ringbuffer.bufs[result_index].buf
@@ -123,6 +135,14 @@ function process_samples!(context::ViewContext{Float32}, samples::AbstractVector
             spec = abs.(fft(context.tmp))
             spec = fftshift(spec)
             spec_db = 20 .* log10.(spec ./ fft_size .+ eps(Float32))
+            if context.avg_enabled
+                @inbounds for k in 1:fft_size
+                    a = Float64(spec[k]) / fft_size
+                    p = a * a
+                    context.avg_power[k] += context.avg_alpha * (p - context.avg_power[k])
+                    spec_db[k] = 10 .* log10(context.avg_power[k] + eps(Float64))
+                end
+            end
             if isready(context.result_ringbuffer.freeQ)
                 result_index = take!(context.result_ringbuffer.freeQ)
                 result_buf = context.result_ringbuffer.bufs[result_index].buf
@@ -143,6 +163,10 @@ function CreateView(::Type{T}, inputSamplingRate::UInt64, numberOfFFTSampling::U
                     title::AbstractString = "FFT View",
                     fmin::Float64 = -Float64(inputSamplingRate) / 2,
                     fmax::Float64 = Float64(inputSamplingRate) / 2,
+                    avg_enabled::Bool = false,
+                    avg_time_s::Real = 0.5,
+                    tick_step::Real = 10_000.0,
+                    label_step::Real = 100_000.0,
                     window_size = (900, 480)) where {T}
 
     fft_size = Int(numberOfFFTSampling)
@@ -150,6 +174,7 @@ function CreateView(::Type{T}, inputSamplingRate::UInt64, numberOfFFTSampling::U
     fmin >= fmax && error("FFTView: Frequency range must satisfy fmin < fmax.")
     frame_size < 1 && error("FFTView: Frame size must be at least 1.")
     poolsize < 1 && error("FFTView: Pool size must be at least 1.")
+    avg_time_s <= 0 && error("FFTView: avg_time_s must be positive.")
 
     freqs = range(-Float64(inputSamplingRate) / 2, Float64(inputSamplingRate) / 2; length = Int(fft_size))
     idx_lo = max(1, searchsortedfirst(freqs, fmin))
@@ -159,10 +184,17 @@ function CreateView(::Type{T}, inputSamplingRate::UInt64, numberOfFFTSampling::U
 
     fig = Figure(size = window_size)
     ax = Axis(fig[1, 1], xlabel = "Frequency (Hz)", ylabel = "Magnitude (dB)")
-    tick_step = 10_000.0
-    label_step = 100_000.0
-    tick_vals = collect(range(fmin, fmax; step = tick_step))
-    tick_labels = [mod(round(v), label_step) == 0 ? string(Int(round(v / 1000))) * "k" : "" for v in tick_vals]
+    tick_start = ceil(fmin / tick_step) * tick_step
+    tick_vals = collect(tick_start:tick_step:fmax)
+    tick_labels = map(tick_vals) do v
+        if mod(round(Int, v), round(Int, label_step)) != 0
+            return ""
+        end
+        if abs(label_step) >= 1e6
+            return string(round(v / 1e6; digits = 1)) * "M"
+        end
+        return string(Int(round(v / 1000))) * "k"
+    end
     zero_idx = findfirst(==(0.0), tick_vals)
     if zero_idx !== nothing
         tick_labels[zero_idx] = "0"
@@ -192,12 +224,19 @@ function CreateView(::Type{T}, inputSamplingRate::UInt64, numberOfFFTSampling::U
 
     result_ringbuffer = RingFrameBuffer(Float64, length(freq_view), poolsize)
     
+    dt = Float64(fft_size) / Float64(inputSamplingRate)
+    alpha = dt / Float64(avg_time_s)
+    alpha > 1.0 && (alpha = 1.0)
     view = ViewContext(Base.Threads.Atomic{Bool}(true),
                        Parameter(inputSamplingRate, window),
                        Vector{T}(undef, fft_size),
                        1,
                        window_coeffs(fft_size, window),
                        Vector{ComplexF32}(undef, fft_size),
+                       avg_enabled,
+                       Float64(avg_time_s),
+                       alpha,
+                       zeros(Float64, fft_size),
                        idx_lo,
                        idx_hi,
                        yobs,
