@@ -39,6 +39,8 @@ mutable struct ViewContext{T} <: SignalFlowBlock
     main_task::Union{Nothing,Task}
     worker::Union{Nothing,Task}
     update_task::Union{Nothing,Task}
+    update_interval::Int
+    update_count::Int
     signal_datas::RingFrameBuffer{T}   
     holdbuf::Union{Nothing, Int}
     result_ringbuffer::RingFrameBuffer{Float64}
@@ -167,6 +169,7 @@ function CreateView(::Type{T}, inputSamplingRate::UInt64, numberOfFFTSampling::U
                     avg_time_s::Real = 0.5,
                     tick_step::Real = 10_000.0,
                     label_step::Real = 100_000.0,
+                    update_interval::Int = 1,
                     window_size = (900, 480)) where {T}
 
     fft_size = Int(numberOfFFTSampling)
@@ -175,6 +178,7 @@ function CreateView(::Type{T}, inputSamplingRate::UInt64, numberOfFFTSampling::U
     frame_size < 1 && error("FFTView: Frame size must be at least 1.")
     poolsize < 1 && error("FFTView: Pool size must be at least 1.")
     avg_time_s <= 0 && error("FFTView: avg_time_s must be positive.")
+    update_interval < 1 && error("FFTView: update_interval must be >= 1.")
 
     freqs = range(-Float64(inputSamplingRate) / 2, Float64(inputSamplingRate) / 2; length = Int(fft_size))
     idx_lo = max(1, searchsortedfirst(freqs, fmin))
@@ -246,6 +250,8 @@ function CreateView(::Type{T}, inputSamplingRate::UInt64, numberOfFFTSampling::U
                        main_task,
                        nothing,
                        nothing,
+                       update_interval,
+                       0,
                        RingFrameBuffer(T, fft_size, poolsize),
                        nothing,
                        result_ringbuffer)
@@ -268,7 +274,11 @@ function task!(context::ViewContext{T}) where {T}
             if isready(context.signal_datas.fullQ)
                 rd_index = take!(context.signal_datas.fullQ)
                 rd_buffer = context.signal_datas.bufs[rd_index]
-                process_samples!(context, rd_buffer.buf, rd_buffer.store_size)
+                context.update_count += 1
+                if context.update_count >= context.update_interval
+                    context.update_count = 0
+                    process_samples!(context, rd_buffer.buf, rd_buffer.store_size)
+                end
                 rd_buffer.store_size = 0
                 put!(context.signal_datas.freeQ, rd_index)
             else
