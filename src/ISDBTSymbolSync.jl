@@ -19,8 +19,17 @@ mutable struct ISDBTSymbolSyncContext <: SignalFlowBlock
     samplerate::Float64
     nfft::Int
     ncp::Int
+    cp_step::Int
     symbol_len::Int
     search_symbols::Int
+    search_window::Int
+    full_search_interval::Int
+    offset_penalty::Float64
+    max_drift::Int
+    lock_metric_thresh::Float64
+    unlock_metric_thresh::Float64
+    lock_confirm::Int
+    unlock_confirm::Int
     cfo_enabled::Bool
     cfo_alpha::Float64
     cfo_rad_per_sample::Float64
@@ -36,6 +45,8 @@ mutable struct ISDBTSymbolSyncContext <: SignalFlowBlock
     stats_peak_obs::Union{Nothing,Observable{Vector{Float64}}}
     stats_offset_avg_obs::Union{Nothing,Observable{Vector{Float64}}}
     stats_peak_avg_obs::Union{Nothing,Observable{Vector{Float64}}}
+    stats_update_interval::Int
+    stats_update_count::Int
     stats_fig::Union{Nothing,Figure}
     stats_screen::Union{Nothing,GLMakie.Screen}
     stats_task::Union{Nothing,Task}
@@ -46,6 +57,13 @@ mutable struct ISDBTSymbolSyncContext <: SignalFlowBlock
     buffer::Vector{ComplexF32}
     buffer_size::Int
     outbuf::Vector{ComplexF32}
+    last_offset::Int
+    last_metric::Float64
+    symbol_counter::Int
+    metric_buf::Vector{Float64}
+    locked::Bool
+    lock_count::Int
+    unlock_count::Int
     ringbuffer::RingFrameBuffer{ComplexF32}
     holdbuf::Union{Nothing, Int}
     worker::Union{Nothing,Task}
@@ -78,12 +96,22 @@ function CreateISDBTSymbolSync(; mode::Int = 3,
                                gi = 1 // 8,
                                samplerate::Real = 8_000_000,
                                search_symbols::Int = 2,
+                               cp_step::Int = 1,
+                               search_window::Int = 0,
+                               full_search_interval::Int = 200,
+                               offset_penalty::Real = 0.0,
+                               max_drift::Int = 0,
+                               lock_metric_thresh::Real = 0.006,
+                               unlock_metric_thresh::Real = 0.003,
+                               lock_confirm::Int = 3,
+                               unlock_confirm::Int = 3,
                                cfo_enabled::Bool = false,
                                cfo_alpha::Real = 0.1,
                                log_interval::Real = 1.0,
                                enable_stats::Bool = false,
                                stats_len::Int = 300,
                                stats_avg_len::Int = 10,
+                               stats_update_interval::Int = 1,
                                stats_window_size = (900, 480),
                                log_stats::Bool = false,
                                poolsize::Int = 8,
@@ -99,9 +127,21 @@ function CreateISDBTSymbolSync(; mode::Int = 3,
     gi_ratio = gi_to_ratio(gi)
     ncp = Int(round(nfft * gi_ratio))
     ncp < 1 && error("ISDBTSymbolSync: CP length must be at least 1.")
+    cp_step < 1 && error("ISDBTSymbolSync: cp_step must be >= 1.")
+    cp_step > ncp && error("ISDBTSymbolSync: cp_step must be <= CP length.")
+    search_window < 0 && error("ISDBTSymbolSync: search_window must be >= 0.")
+    full_search_interval < 1 && error("ISDBTSymbolSync: full_search_interval must be >= 1.")
+    offset_penalty < 0 && error("ISDBTSymbolSync: offset_penalty must be >= 0.")
+    max_drift < 0 && error("ISDBTSymbolSync: max_drift must be >= 0.")
+    lock_metric_thresh <= 0 && error("ISDBTSymbolSync: lock_metric_thresh must be positive.")
+    unlock_metric_thresh <= 0 && error("ISDBTSymbolSync: unlock_metric_thresh must be positive.")
+    lock_confirm < 1 && error("ISDBTSymbolSync: lock_confirm must be >= 1.")
+    unlock_confirm < 1 && error("ISDBTSymbolSync: unlock_confirm must be >= 1.")
+    unlock_metric_thresh >= lock_metric_thresh && error("ISDBTSymbolSync: unlock_metric_thresh must be < lock_metric_thresh.")
     symbol_len = nfft + ncp
     stats_len < 2 && error("ISDBTSymbolSync: stats_len must be at least 2.")
     stats_avg_len < 1 && error("ISDBTSymbolSync: stats_avg_len must be at least 1.")
+    stats_update_interval < 1 && error("ISDBTSymbolSync: stats_update_interval must be >= 1.")
 
     new_sinks = Channel{SignalFlowBlock}(4)
     sinks = Vector{SignalFlowBlock}()
@@ -114,8 +154,17 @@ function CreateISDBTSymbolSync(; mode::Int = 3,
                                  Float64(samplerate),
                                  nfft,
                                  ncp,
+                                 Int(cp_step),
                                  symbol_len,
                                  search_symbols,
+                                 Int(search_window),
+                                 Int(full_search_interval),
+                                 Float64(offset_penalty),
+                                 Int(max_drift),
+                                 Float64(lock_metric_thresh),
+                                 Float64(unlock_metric_thresh),
+                                 Int(lock_confirm),
+                                 Int(unlock_confirm),
                                  cfo_enabled,
                                  Float64(cfo_alpha),
                                  0.0,
@@ -131,6 +180,8 @@ function CreateISDBTSymbolSync(; mode::Int = 3,
                                  nothing,
                                  nothing,
                                  nothing,
+                                 Int(stats_update_interval),
+                                 0,
                                  nothing,
                                  nothing,
                                  nothing,
@@ -141,6 +192,13 @@ function CreateISDBTSymbolSync(; mode::Int = 3,
                                  buffer,
                                  0,
                                  outbuf,
+                                 0,
+                                 0.0,
+                                 0,
+                                 Vector{Float64}(undef, symbol_len),
+                                 false,
+                                 0,
+                                 0,
                                  RingFrameBuffer(ComplexF32, frame_size, poolsize),
                                  nothing,
                                  nothing,
@@ -159,7 +217,8 @@ function CreateISDBTSymbolSync(; mode::Int = 3,
         line_off_avg = lines!(ax1, x, ctx.stats_offset_avg_obs; linewidth = 1, color = :red)
         line_peak = lines!(ax2, x, ctx.stats_peak_obs; linewidth = 1, color = :blue)
         line_peak_avg = lines!(ax2, x, ctx.stats_peak_avg_obs; linewidth = 1, color = :red)
-        ylims!(ax1, 0.0, Float64(ctx.symbol_len))
+        margin = Float64(ctx.symbol_len) * 0.1
+        ylims!(ax1, -margin, Float64(ctx.symbol_len))
         ylims!(ax2, -6.0, 0.0)
         axislegend(ax1, [line_off, line_off_avg], ["Offset", "Offset(avg)"])
         axislegend(ax2, [line_peak, line_peak_avg], ["Peak", "Peak(avg)"])
@@ -191,77 +250,287 @@ end
 function process_buffer!(context::ISDBTSymbolSyncContext)
     min_needed = context.symbol_len * context.search_symbols
     while context.buffer_size >= min_needed
-        search_len = context.buffer_size - context.symbol_len + 1
-        search_len > context.symbol_len && (search_len = context.symbol_len)
+        max_offset = context.buffer_size - context.symbol_len * context.search_symbols + 1
+        search_len = min(context.symbol_len, max_offset)
+        search_len < 1 && return nothing
+
         best_offset = 1
         best_metric = -1.0
-        @inbounds for offset in 1:search_len
-            # Normalized CP correlation metric.
-            s_re = 0.0
-            s_im = 0.0
-            p1 = 0.0
-            p2 = 0.0
-            base_a = offset
-            base_b = offset + context.nfft
-            for k in 0:context.ncp - 1
-                a = context.buffer[base_a + k]
-                b = context.buffer[base_b + k]
-                s_re += real(a) * real(b) + imag(a) * imag(b)
-                s_im += real(a) * imag(b) - imag(a) * real(b)
-                p1 += real(a) * real(a) + imag(a) * imag(a)
-                p2 += real(b) * real(b) + imag(b) * imag(b)
+        coarse_step = max(1, context.ncp ÷ 2)
+        best_coarse = 1
+        best_coarse_metric = -1.0
+        search_start = 1
+        search_end = search_len
+        full_search = (context.symbol_counter % context.full_search_interval) == 0
+        expected_offset = context.last_offset > 0 ? context.last_offset : 1
+        if !context.locked
+            full_search = true
+        end
+        if !full_search
+            center = clamp(expected_offset, 1, search_len)
+            half = context.search_window > 0 ? min(search_len - 1, context.search_window) :
+                                               min(search_len - 1, context.ncp)
+            search_start = max(1, center - half)
+            search_end = min(search_len, center + half)
+        end
+
+        nwin = search_end - search_start + 1
+        if length(context.metric_buf) < nwin
+            resize!(context.metric_buf, nwin)
+        end
+        @inbounds for i in 1:nwin
+            context.metric_buf[i] = 0.0
+        end
+
+        if context.cp_step == 1
+            @inbounds for sym in 0:context.search_symbols - 1
+                base_a0 = search_start + sym * context.symbol_len
+                base_b0 = base_a0 + context.nfft
+                s_re = 0.0
+                s_im = 0.0
+                p1 = 0.0
+                p2 = 0.0
+                for k in 0:context.ncp - 1
+                    a = context.buffer[base_a0 + k]
+                    b = context.buffer[base_b0 + k]
+                    s_re += real(a) * real(b) + imag(a) * imag(b)
+                    s_im += real(a) * imag(b) - imag(a) * real(b)
+                    p1 += real(a) * real(a) + imag(a) * imag(a)
+                    p2 += real(b) * real(b) + imag(b) * imag(b)
+                end
+                metric = (s_re * s_re + s_im * s_im) / (p1 * p2 + eps(Float64))
+                context.metric_buf[1] += metric
+
+                for i in 2:nwin
+                    a_old = context.buffer[base_a0 + i - 2]
+                    a_new = context.buffer[base_a0 + i - 2 + context.ncp]
+                    b_old = context.buffer[base_b0 + i - 2]
+                    b_new = context.buffer[base_b0 + i - 2 + context.ncp]
+                    s_re += real(a_new) * real(b_new) + imag(a_new) * imag(b_new)
+                    s_im += real(a_new) * imag(b_new) - imag(a_new) * real(b_new)
+                    s_re -= real(a_old) * real(b_old) + imag(a_old) * imag(b_old)
+                    s_im -= real(a_old) * imag(b_old) - imag(a_old) * real(b_old)
+                    p1 += real(a_new) * real(a_new) + imag(a_new) * imag(a_new)
+                    p2 += real(b_new) * real(b_new) + imag(b_new) * imag(b_new)
+                    p1 -= real(a_old) * real(a_old) + imag(a_old) * imag(a_old)
+                    p2 -= real(b_old) * real(b_old) + imag(b_old) * imag(b_old)
+                    metric = (s_re * s_re + s_im * s_im) / (p1 * p2 + eps(Float64))
+                    context.metric_buf[i] += metric
+                end
             end
-            metric = (s_re * s_re + s_im * s_im) / (p1 * p2 + eps(Float64))
-            if metric > best_metric
+        else
+            @inbounds for sym in 0:context.search_symbols - 1
+                for i in 1:nwin
+                    offset = search_start + i - 1
+                    s_re = 0.0
+                    s_im = 0.0
+                    p1 = 0.0
+                    p2 = 0.0
+                    base_a = offset + sym * context.symbol_len
+                    base_b = base_a + context.nfft
+                    for k in 0:context.cp_step:context.ncp - 1
+                        a = context.buffer[base_a + k]
+                        b = context.buffer[base_b + k]
+                        s_re += real(a) * real(b) + imag(a) * imag(b)
+                        s_im += real(a) * imag(b) - imag(a) * real(b)
+                        p1 += real(a) * real(a) + imag(a) * imag(a)
+                        p2 += real(b) * real(b) + imag(b) * imag(b)
+                    end
+                    metric = (s_re * s_re + s_im * s_im) / (p1 * p2 + eps(Float64))
+                    context.metric_buf[i] += metric
+                end
+            end
+        end
+
+        best_metric = -1.0
+        best_score = -1.0
+        best_offset = search_start
+        @inbounds for i in 1:nwin
+            metric = context.metric_buf[i] / context.search_symbols
+            score = metric
+            if context.locked && !full_search && context.offset_penalty > 0
+                offset = search_start + i - 1
+                score -= context.offset_penalty * abs(offset - expected_offset) / context.symbol_len
+            end
+            if score > best_score
+                best_score = score
                 best_metric = metric
-                best_offset = offset
+                best_offset = search_start + i - 1
             end
         end
 
-        # Extract CP-removed symbol.
-        start = best_offset + context.ncp
-        copyto!(context.outbuf, 1, context.buffer, start, context.nfft)
+        if context.last_offset > 0
+            retry_thresh = max(0.5 * context.last_metric, 1e-3)
+            if best_metric < retry_thresh && !full_search
+                search_start = 1
+                search_end = search_len
+                nwin = search_end - search_start + 1
+                if length(context.metric_buf) < nwin
+                    resize!(context.metric_buf, nwin)
+                end
+                @inbounds for i in 1:nwin
+                    context.metric_buf[i] = 0.0
+                end
+                if context.cp_step == 1
+                    @inbounds for sym in 0:context.search_symbols - 1
+                        base_a0 = search_start + sym * context.symbol_len
+                        base_b0 = base_a0 + context.nfft
+                        s_re = 0.0
+                        s_im = 0.0
+                        p1 = 0.0
+                        p2 = 0.0
+                        for k in 0:context.ncp - 1
+                            a = context.buffer[base_a0 + k]
+                            b = context.buffer[base_b0 + k]
+                            s_re += real(a) * real(b) + imag(a) * imag(b)
+                            s_im += real(a) * imag(b) - imag(a) * real(b)
+                            p1 += real(a) * real(a) + imag(a) * imag(a)
+                            p2 += real(b) * real(b) + imag(b) * imag(b)
+                        end
+                        metric = (s_re * s_re + s_im * s_im) / (p1 * p2 + eps(Float64))
+                        context.metric_buf[1] += metric
 
-        if context.cfo_enabled
-            base_a = best_offset
-            base_b = best_offset + context.nfft
-            s_re = 0.0
-            s_im = 0.0
-            @inbounds for k in 0:context.ncp - 1
-                a = context.buffer[base_a + k]
-                b = context.buffer[base_b + k]
-                s_re += real(a) * real(b) + imag(a) * imag(b)
-                s_im += real(a) * imag(b) - imag(a) * real(b)
-            end
-            phi = atan(s_im, s_re)
-            est = phi / context.nfft
-            context.cfo_rad_per_sample += context.cfo_alpha * (est - context.cfo_rad_per_sample)
-            phase = context.cfo_phase
-            @inbounds for k in 1:context.nfft
-                c = cos(phase)
-                s = sin(phase)
-                v = context.outbuf[k]
-                context.outbuf[k] = ComplexF32(Float32(real(v) * c + imag(v) * s),
-                                               Float32(imag(v) * c - real(v) * s))
-                phase += context.cfo_rad_per_sample
-            end
-            context.cfo_phase = phase
-            if context.cfo_phase > Float64(π) || context.cfo_phase < -Float64(π)
-                context.cfo_phase = mod(context.cfo_phase + Float64(π), 2 * Float64(π)) - Float64(π)
+                        for i in 2:nwin
+                            a_old = context.buffer[base_a0 + i - 2]
+                            a_new = context.buffer[base_a0 + i - 2 + context.ncp]
+                            b_old = context.buffer[base_b0 + i - 2]
+                            b_new = context.buffer[base_b0 + i - 2 + context.ncp]
+                            s_re += real(a_new) * real(b_new) + imag(a_new) * imag(b_new)
+                            s_im += real(a_new) * imag(b_new) - imag(a_new) * real(b_new)
+                            s_re -= real(a_old) * real(b_old) + imag(a_old) * imag(b_old)
+                            s_im -= real(a_old) * imag(b_old) - imag(a_old) * real(b_old)
+                            p1 += real(a_new) * real(a_new) + imag(a_new) * imag(a_new)
+                            p2 += real(b_new) * real(b_new) + imag(b_new) * imag(b_new)
+                            p1 -= real(a_old) * real(a_old) + imag(a_old) * imag(a_old)
+                            p2 -= real(b_old) * real(b_old) + imag(b_old) * imag(b_old)
+                            metric = (s_re * s_re + s_im * s_im) / (p1 * p2 + eps(Float64))
+                            context.metric_buf[i] += metric
+                        end
+                    end
+                else
+                    @inbounds for sym in 0:context.search_symbols - 1
+                        for i in 1:nwin
+                            offset = search_start + i - 1
+                            s_re = 0.0
+                            s_im = 0.0
+                            p1 = 0.0
+                            p2 = 0.0
+                            base_a = offset + sym * context.symbol_len
+                            base_b = base_a + context.nfft
+                            for k in 0:context.cp_step:context.ncp - 1
+                                a = context.buffer[base_a + k]
+                                b = context.buffer[base_b + k]
+                                s_re += real(a) * real(b) + imag(a) * imag(b)
+                                s_im += real(a) * imag(b) - imag(a) * real(b)
+                                p1 += real(a) * real(a) + imag(a) * imag(a)
+                                p2 += real(b) * real(b) + imag(b) * imag(b)
+                            end
+                            metric = (s_re * s_re + s_im * s_im) / (p1 * p2 + eps(Float64))
+                            context.metric_buf[i] += metric
+                        end
+                    end
+                end
+                best_metric = -1.0
+                best_score = -1.0
+                best_offset = 1
+                @inbounds for i in 1:nwin
+                    metric = context.metric_buf[i] / context.search_symbols
+                    score = metric
+                    if context.locked && !full_search && context.offset_penalty > 0
+                        offset = i
+                        score -= context.offset_penalty * abs(offset - expected_offset) / context.symbol_len
+                    end
+                    if score > best_score
+                        best_score = score
+                        best_metric = metric
+                        best_offset = i
+                    end
+                end
             end
         end
 
-        while isready(context.new_sinks)
-            push!(context.sinks, take!(context.new_sinks))
+        if context.locked && !full_search && context.max_drift > 0
+            if abs(best_offset - expected_offset) > context.max_drift
+                best_offset = expected_offset
+            end
         end
-        for sink in context.sinks
-            input!(sink, context.outbuf, context.nfft)
+
+        if best_metric >= context.lock_metric_thresh
+            context.lock_count += 1
+            context.unlock_count = 0
+        elseif best_metric <= context.unlock_metric_thresh
+            context.unlock_count += 1
+            context.lock_count = 0
+        else
+            context.lock_count = 0
+            context.unlock_count = 0
+        end
+        if !context.locked && context.lock_count >= context.lock_confirm
+            context.locked = true
+            println("ISDBTSymbolSync: relock offset=", best_offset, " peak=", best_metric)
+        elseif context.locked && context.unlock_count >= context.unlock_confirm
+            context.locked = false
+            println("ISDBTSymbolSync: unlock offset=", best_offset, " peak=", best_metric)
+        end
+
+        if context.locked
+            # Extract CP-removed symbol.
+            start = best_offset + context.ncp
+            copyto!(context.outbuf, 1, context.buffer, start, context.nfft)
+
+            if context.cfo_enabled
+                base_a = best_offset
+                base_b = best_offset + context.nfft
+                s_re = 0.0
+                s_im = 0.0
+                @inbounds for k in 0:context.cp_step:context.ncp - 1
+                    a = context.buffer[base_a + k]
+                    b = context.buffer[base_b + k]
+                    s_re += real(a) * real(b) + imag(a) * imag(b)
+                    s_im += real(a) * imag(b) - imag(a) * real(b)
+                end
+                phi = atan(s_im, s_re)
+                est = phi / context.nfft
+                context.cfo_rad_per_sample += context.cfo_alpha * (est - context.cfo_rad_per_sample)
+                phase = context.cfo_phase
+                omega = context.cfo_rad_per_sample
+                rot_re = cos(phase)
+                rot_im = -sin(phase)
+                step_re = cos(omega)
+                step_im = -sin(omega)
+                @inbounds for k in 1:context.nfft
+                    v = context.outbuf[k]
+                    a = real(v)
+                    b = imag(v)
+                    context.outbuf[k] = ComplexF32(Float32(a * rot_re - b * rot_im),
+                                                   Float32(a * rot_im + b * rot_re))
+                    r_re = rot_re * step_re - rot_im * step_im
+                    r_im = rot_re * step_im + rot_im * step_re
+                    rot_re = r_re
+                    rot_im = r_im
+                end
+                context.cfo_phase = phase + omega * context.nfft
+                if context.cfo_phase > Float64(π) || context.cfo_phase < -Float64(π)
+                    context.cfo_phase = mod(context.cfo_phase + Float64(π), 2 * Float64(π)) - Float64(π)
+                end
+            end
+
+            while isready(context.new_sinks)
+                push!(context.sinks, take!(context.new_sinks))
+            end
+            for sink in context.sinks
+                input!(sink, context.outbuf, context.nfft)
+            end
         end
         if context.enable_stats && context.statsQ !== nothing
-            if isready(context.statsQ)
-                take!(context.statsQ)
+            context.stats_update_count += 1
+            if context.stats_update_count >= context.stats_update_interval
+                context.stats_update_count = 0
+                if isready(context.statsQ)
+                    take!(context.statsQ)
+                end
+                put!(context.statsQ, (Float64(best_offset), Float64(best_metric)))
             end
-            put!(context.statsQ, (Float64(best_offset), Float64(best_metric)))
         end
         if context.log_stats
             now = time()
@@ -279,6 +548,11 @@ function process_buffer!(context::ISDBTSymbolSyncContext)
         end
         context.buffer_size = max(remaining, 0)
         resize!(context.buffer, context.buffer_size)
+
+        drift = best_offset - expected_offset
+        context.last_metric = best_metric
+        context.last_offset = clamp(1 + drift, 1, context.symbol_len)
+        context.symbol_counter += 1
     end
     return nothing
 end
