@@ -15,6 +15,8 @@ mutable struct ViewContext <: SignalFlowBlock
     main_task::Union{Nothing,Task}
     worker::Union{Nothing,Task}
     update_task::Union{Nothing,Task}
+    update_interval::Int
+    update_count::Int
     ringbuffer::RingFrameBuffer{ComplexF32}
     holdbuf::Union{Nothing, Int}
     result_ringbuffer::RingFrameBuffer{Point2f}
@@ -43,11 +45,13 @@ function CreateView(inputSamplingRate::UInt64;
                     poolsize::Int = 16,
                     axis_limit::Real = 1.2,
                     title::AbstractString = "Constellation View",
+                    update_interval::Int = 1,
                     window_size = (700, 700))
 
     frame_size < 1 && error("ConstellationView: frame_size must be at least 1.")
     poolsize < 1 && error("ConstellationView: poolsize must be at least 1.")
     axis_limit <= 0 && error("ConstellationView: axis_limit must be positive.")
+    update_interval < 1 && error("ConstellationView: update_interval must be >= 1.")
 
     _ = inputSamplingRate
 
@@ -88,6 +92,8 @@ function CreateView(inputSamplingRate::UInt64;
                        main_task,
                        nothing,
                        nothing,
+                       update_interval,
+                       0,
                        RingFrameBuffer(ComplexF32, frame_size, poolsize),
                        nothing,
                        result_ringbuffer)
@@ -110,7 +116,11 @@ function task!(context::ViewContext)
             if isready(context.ringbuffer.fullQ)
                 rd_index = take!(context.ringbuffer.fullQ)
                 rd_buffer = context.ringbuffer.bufs[rd_index]
-                process_samples!(context, rd_buffer.buf, rd_buffer.store_size)
+                context.update_count += 1
+                if context.update_count >= context.update_interval
+                    context.update_count = 0
+                    process_samples!(context, rd_buffer.buf, rd_buffer.store_size)
+                end
                 rd_buffer.store_size = 0
                 put!(context.ringbuffer.freeQ, rd_index)
             else
