@@ -95,6 +95,7 @@ end
 function CreateISDBTSymbolSync(; mode::Int = 3,
                                gi = 1 // 8,
                                samplerate::Real = 8_000_000,
+                               nfft_override::Union{Nothing,Int} = nothing,
                                search_symbols::Int = 2,
                                cp_step::Int = 1,
                                search_window::Int = 0,
@@ -123,7 +124,8 @@ function CreateISDBTSymbolSync(; mode::Int = 3,
     poolsize < 1 && error("ISDBTSymbolSync: poolsize must be at least 1.")
     frame_size < 1 && error("ISDBTSymbolSync: frame_size must be at least 1.")
 
-    nfft = mode_to_nfft(mode)
+    nfft = nfft_override === nothing ? mode_to_nfft(mode) : nfft_override
+    nfft < 32 && error("ISDBTSymbolSync: nfft must be >= 32.")
     gi_ratio = gi_to_ratio(gi)
     ncp = Int(round(nfft * gi_ratio))
     ncp < 1 && error("ISDBTSymbolSync: CP length must be at least 1.")
@@ -492,27 +494,6 @@ function process_buffer!(context::ISDBTSymbolSyncContext)
                 phi = atan(s_im, s_re)
                 est = phi / context.nfft
                 context.cfo_rad_per_sample += context.cfo_alpha * (est - context.cfo_rad_per_sample)
-                phase = context.cfo_phase
-                omega = context.cfo_rad_per_sample
-                rot_re = cos(phase)
-                rot_im = -sin(phase)
-                step_re = cos(omega)
-                step_im = -sin(omega)
-                @inbounds for k in 1:context.nfft
-                    v = context.outbuf[k]
-                    a = real(v)
-                    b = imag(v)
-                    context.outbuf[k] = ComplexF32(Float32(a * rot_re - b * rot_im),
-                                                   Float32(a * rot_im + b * rot_re))
-                    r_re = rot_re * step_re - rot_im * step_im
-                    r_im = rot_re * step_im + rot_im * step_re
-                    rot_re = r_re
-                    rot_im = r_im
-                end
-                context.cfo_phase = phase + omega * context.nfft
-                if context.cfo_phase > Float64(π) || context.cfo_phase < -Float64(π)
-                    context.cfo_phase = mod(context.cfo_phase + Float64(π), 2 * Float64(π)) - Float64(π)
-                end
             end
 
             while isready(context.new_sinks)
