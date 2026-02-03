@@ -3,3 +3,5 @@ This project is intended to develop a collection of modules for performing Softw
 ## Implementation approach
 - Each module performs its processing in a separate thread.
 - Data exchange between threads is handled using RingBuffers.jl.
+## Tools
+"python3" is instead of python.
