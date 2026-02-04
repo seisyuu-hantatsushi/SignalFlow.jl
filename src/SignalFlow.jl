@@ -3,8 +3,8 @@ module SignalFlow
 abstract type SignalFlowBlock end
 function input! end
 
-include("ADFMCOMMS2Src.jl")
 include("RingBuffers.jl")
+include("ADFMCOMMS2Src.jl")
 include("ISDBTPRBS.jl")
 include("ISDBTSymbolSync.jl")
 include("ISDBT1SegSymbolSync.jl")

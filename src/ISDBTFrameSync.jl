@@ -4,11 +4,7 @@ import ..SignalFlowBlock
 import ..input!
 import ..RingBuffers: RingFrameBuffer
 
-mutable struct ISDBTFrameSyncContext <: SignalFlowBlock
-    running::Base.Threads.Atomic{Bool}
-    nfft::Int
-    frame_symbols::Int
-    tmcc_bins::Vector{Int}
+struct ISDBTFrameSyncParams
     lock_threshold::Float64
     unlock_threshold::Float64
     lock_confirm::Int
@@ -21,11 +17,28 @@ mutable struct ISDBTFrameSyncContext <: SignalFlowBlock
     warmup_cycle_count::Int
     ref_release_good_cycles::Int
     input_gap_threshold_ratio::Float64
+    gap_freeze_min_ms::Float64
+    gap_freeze_symbols::Int
+    metric_guard_band::Float64
+    cycle_ema_outlier_ratio::Float64
     corr_alpha::Float64
-    corr_ema::Float64
-    corr_ema_ready::Bool
+    expected_symbol_ms::Float64
+end
+
+mutable struct ISDBTFrameSyncLogState
     log_interval::Int
     log_count::Int
+    cycle_log_interval::Int
+    cycle_log_count::Int
+    input_gap_log_interval_sec::Float64
+    last_input_gap_log_time::Float64
+    input_gap_suppressed::Int
+end
+
+mutable struct ISDBTFrameSyncRuntime
+    gap_freeze_countdown::Int
+    corr_ema::Float64
+    corr_ema_ready::Bool
     locked::Bool
     lock_count::Int
     unlock_count::Int
@@ -41,16 +54,25 @@ mutable struct ISDBTFrameSyncContext <: SignalFlowBlock
     symbol_index::Int
     total_symbols::Int64
     last_wrap_symbols::Int64
+    input_overrun_count::Int
+    last_input_ns::Int64
+    input_gap_count::Int
+end
+
+mutable struct ISDBTFrameSyncContext <: SignalFlowBlock
+    running::Base.Threads.Atomic{Bool}
+    nfft::Int
+    frame_symbols::Int
+    tmcc_bins::Vector{Int}
+    params::ISDBTFrameSyncParams
+    logs::ISDBTFrameSyncLogState
+    state::ISDBTFrameSyncRuntime
     symbol_index_ref::Base.Threads.Atomic{Int}
     tmcc_ring::Vector{Vector{ComplexF32}}
     filled::Int
     outbuf::Vector{ComplexF32}
     ringbuffer::RingFrameBuffer{ComplexF32}
     holdbuf::Union{Nothing, Int}
-    input_overrun_count::Int
-    expected_symbol_ms::Float64
-    last_input_ns::Int64
-    input_gap_count::Int
     worker::Union{Nothing,Task}
     new_sinks::Channel{SignalFlowBlock}
     sinks::Vector{SignalFlowBlock}
@@ -71,8 +93,14 @@ function CreateISDBTFrameSync(; nfft::Int = 8192,
                               warmup_cycle_count::Int = 2,
                               ref_release_good_cycles::Int = 2,
                               input_gap_threshold_ratio::Real = 2.5,
+                              gap_freeze_min_ms::Real = 45.0,
+                              gap_freeze_symbols::Int = 8,
+                              metric_guard_band::Real = 0.03,
+                              cycle_ema_outlier_ratio::Real = 0.15,
                               corr_alpha::Real = 0.2,
                               log_interval::Int = 200,
+                              cycle_log_interval::Int = 20,
+                              input_gap_log_interval_sec::Real = 1.0,
                               poolsize::Int = 8)
     nfft < 32 && error("ISDBTFrameSync: nfft must be >= 32.")
     frame_symbols < 1 && error("ISDBTFrameSync: frame_symbols must be >= 1.")
@@ -90,59 +118,78 @@ function CreateISDBTFrameSync(; nfft::Int = 8192,
     warmup_cycle_count < 0 && error("ISDBTFrameSync: warmup_cycle_count must be >= 0.")
     ref_release_good_cycles < 1 && error("ISDBTFrameSync: ref_release_good_cycles must be >= 1.")
     input_gap_threshold_ratio <= 0 && error("ISDBTFrameSync: input_gap_threshold_ratio must be > 0.")
+    gap_freeze_min_ms <= 0 && error("ISDBTFrameSync: gap_freeze_min_ms must be > 0.")
+    gap_freeze_symbols < 0 && error("ISDBTFrameSync: gap_freeze_symbols must be >= 0.")
+    metric_guard_band < 0 && error("ISDBTFrameSync: metric_guard_band must be >= 0.")
+    cycle_ema_outlier_ratio < 0 && error("ISDBTFrameSync: cycle_ema_outlier_ratio must be >= 0.")
     (corr_alpha <= 0 || corr_alpha > 1) && error("ISDBTFrameSync: corr_alpha must be in (0, 1].")
     log_interval < 1 && error("ISDBTFrameSync: log_interval must be >= 1.")
+    cycle_log_interval < 1 && error("ISDBTFrameSync: cycle_log_interval must be >= 1.")
+    input_gap_log_interval_sec <= 0 && error("ISDBTFrameSync: input_gap_log_interval_sec must be > 0.")
     poolsize < 1 && error("ISDBTFrameSync: poolsize must be at least 1.")
 
     tmcc_ring = [Vector{ComplexF32}(undef, length(tmcc_bins)) for _ in 1:frame_symbols]
     new_sinks = Channel{SignalFlowBlock}(4)
     sinks = Vector{SignalFlowBlock}()
+    params = ISDBTFrameSyncParams(Float64(lock_threshold),
+                                  Float64(unlock_threshold),
+                                  Int(lock_confirm),
+                                  Int(unlock_confirm),
+                                  Int(min_lock_symbols),
+                                  Float64(expected_frame_ms),
+                                  Float64(cycle_outlier_ratio),
+                                  Int(max_cycle_fold),
+                                  Int(outlier_relock_count),
+                                  Int(warmup_cycle_count),
+                                  Int(ref_release_good_cycles),
+                                  Float64(input_gap_threshold_ratio),
+                                  Float64(gap_freeze_min_ms),
+                                  Int(gap_freeze_symbols),
+                                  Float64(metric_guard_band),
+                                  Float64(cycle_ema_outlier_ratio),
+                                  Float64(corr_alpha),
+                                  frame_symbols > 0 && expected_frame_ms > 0 ? Float64(expected_frame_ms) / frame_symbols : 0.0)
+    logs = ISDBTFrameSyncLogState(Int(log_interval),
+                                  0,
+                                  Int(cycle_log_interval),
+                                  0,
+                                  Float64(input_gap_log_interval_sec),
+                                  0.0,
+                                  0)
+    state = ISDBTFrameSyncRuntime(0,
+                                  0.0,
+                                  false,
+                                  false,
+                                  0,
+                                  0,
+                                  0,
+                                  0,
+                                  0.0,
+                                  0,
+                                  0,
+                                  0,
+                                  Int(warmup_cycle_count),
+                                  0,
+                                  true,
+                                  0,
+                                  0,
+                                  0,
+                                  0,
+                                  0,
+                                  0)
     ctx = ISDBTFrameSyncContext(Base.Threads.Atomic{Bool}(true),
                                 nfft,
                                 frame_symbols,
                                 tmcc_bins,
-                                Float64(lock_threshold),
-                                Float64(unlock_threshold),
-                                Int(lock_confirm),
-                                Int(unlock_confirm),
-                                Int(min_lock_symbols),
-                                Float64(expected_frame_ms),
-                                Float64(cycle_outlier_ratio),
-                                Int(max_cycle_fold),
-                                Int(outlier_relock_count),
-                                Int(warmup_cycle_count),
-                                Int(ref_release_good_cycles),
-                                Float64(input_gap_threshold_ratio),
-                                Float64(corr_alpha),
-                                0.0,
-                                false,
-                                Int(log_interval),
-                                0,
-                                false,
-                                0,
-                                0,
-                                0,
-                                0,
-                                0.0,
-                                0,
-                                0,
-                                0,
-                                Int(warmup_cycle_count),
-                                0,
-                                true,
-                                0,
-                                0,
-                                0,
+                                params,
+                                logs,
+                                state,
                                 Base.Threads.Atomic{Int}(0),
                                 tmcc_ring,
                                 0,
                                 Vector{ComplexF32}(undef, nfft),
                                 RingFrameBuffer(ComplexF32, nfft, poolsize),
                                 nothing,
-                                0,
-                                frame_symbols > 0 && expected_frame_ms > 0 ? Float64(expected_frame_ms) / frame_symbols : 0.0,
-                                0,
-                                0,
                                 nothing,
                                 new_sinks,
                                 sinks)
@@ -157,9 +204,9 @@ function task!(context::ISDBTFrameSyncContext)
                 rd_index = take!(context.ringbuffer.fullQ)
                 rd_buffer = context.ringbuffer.bufs[rd_index]
                 if rd_buffer.store_size == context.nfft
-                    context.total_symbols += 1
+                    context.state.total_symbols += 1
                     skip_ref_update = false
-                    idx = (context.symbol_index % context.frame_symbols) + 1
+                    idx = (context.state.symbol_index % context.frame_symbols) + 1
                     prev = context.tmcc_ring[idx]
                     corr = 0.0
                     if context.filled >= context.frame_symbols
@@ -177,50 +224,60 @@ function task!(context::ISDBTFrameSyncContext)
                         end
                         den = sqrt(p_cur * p_prev)
                         corr = den > 0 ? sqrt(s_re * s_re + s_im * s_im) / den : 0.0
-                        if context.corr_ema_ready
-                            context.corr_ema = context.corr_alpha * corr + (1.0 - context.corr_alpha) * context.corr_ema
-                        else
-                            context.corr_ema = corr
-                            context.corr_ema_ready = true
+                        freeze_active = context.state.gap_freeze_countdown > 0
+                        if freeze_active
+                            context.state.gap_freeze_countdown -= 1
                         end
-                        metric = context.corr_ema
+                        if !freeze_active && context.state.corr_ema_ready
+                            context.state.corr_ema = context.params.corr_alpha * corr +
+                                               (1.0 - context.params.corr_alpha) * context.state.corr_ema
+                        elseif !freeze_active
+                            context.state.corr_ema = corr
+                            context.state.corr_ema_ready = true
+                        else
+                            skip_ref_update = true
+                        end
+                        metric = context.state.corr_ema_ready ? context.state.corr_ema : corr
 
-                        context.log_count += 1
-                        if context.log_count >= context.log_interval
-                            context.log_count = 0
+                        context.logs.log_count += 1
+                        if context.logs.log_count >= context.logs.log_interval
+                            context.logs.log_count = 0
                             println("ISDBTFrameSync: corr=", corr,
                                     " ema=", round(metric, digits = 4),
-                                    " locked=", context.locked)
+                                    " locked=", context.state.locked)
                         end
-                        if metric >= context.lock_threshold
-                            context.lock_count += 1
-                            context.unlock_count = 0
-                        elseif metric <= context.unlock_threshold
-                            context.lock_count = 0
-                            if context.locked && context.lock_age >= context.min_lock_symbols
-                                context.unlock_count += 1
+                        if !freeze_active
+                            if metric >= context.params.lock_threshold + context.params.metric_guard_band
+                                context.state.lock_count += 1
+                                context.state.unlock_count = 0
+                            elseif metric <= context.params.unlock_threshold - context.params.metric_guard_band
+                                context.state.lock_count = 0
+                                if context.state.locked && context.state.lock_age >= context.params.min_lock_symbols
+                                    context.state.unlock_count += 1
+                                else
+                                    context.state.unlock_count = 0
+                                end
                             else
-                                context.unlock_count = 0
+                                # Guard band around thresholds: keep state to avoid noisy flips.
+                                context.state.unlock_count = 0
+                                context.state.lock_count = 0
                             end
-                        else
-                            context.lock_count = 0
-                            context.unlock_count = 0
                         end
-                        if !context.locked && context.lock_count >= context.lock_confirm
-                            context.locked = true
-                            context.lock_age = 0
-                            context.symbol_index = 0
+                        if !context.state.locked && context.state.lock_count >= context.params.lock_confirm
+                            context.state.locked = true
+                            context.state.lock_age = 0
+                            context.state.symbol_index = 0
                             context.symbol_index_ref[] = 0
-                            context.last_cycle_ns = 0
-                            context.cycle_count = 0
-                            context.warmup_cycles_left = context.warmup_cycle_count
-                            context.good_cycle_streak = 0
-                            context.ref_update_hold = true
+                            context.state.last_cycle_ns = 0
+                            context.state.cycle_count = 0
+                            context.state.warmup_cycles_left = context.params.warmup_cycle_count
+                            context.state.good_cycle_streak = 0
+                            context.state.ref_update_hold = true
                             println("ISDBTFrameSync: lock corr=", corr, " ema=", round(metric, digits = 4))
-                        elseif context.locked && context.unlock_count >= context.unlock_confirm
-                            context.locked = false
-                            context.lock_age = 0
-                            context.ref_update_hold = true
+                        elseif context.state.locked && context.state.unlock_count >= context.params.unlock_confirm
+                            context.state.locked = false
+                            context.state.lock_age = 0
+                            context.state.ref_update_hold = true
                             println("ISDBTFrameSync: unlock corr=", corr, " ema=", round(metric, digits = 4))
                         end
                     end
@@ -230,41 +287,49 @@ function task!(context::ISDBTFrameSyncContext)
                     end
                     context.filled = min(context.filled + 1, context.frame_symbols)
                     wrapped = false
-                    context.symbol_index += 1
-                    if context.symbol_index >= context.frame_symbols
-                        context.symbol_index = 0
+                    context.state.symbol_index += 1
+                    if context.state.symbol_index >= context.frame_symbols
+                        context.state.symbol_index = 0
                         wrapped = true
                     end
                     if wrapped
                         now_ns = time_ns()
-                        symbol_delta = context.total_symbols - context.last_wrap_symbols
-                        context.last_wrap_symbols = context.total_symbols
-                        if context.last_cycle_ns > 0
-                            dt_ms_raw = (now_ns - context.last_cycle_ns) / 1_000_000.0
+                        symbol_delta = context.state.total_symbols - context.state.last_wrap_symbols
+                        context.state.last_wrap_symbols = context.state.total_symbols
+                        if context.state.last_cycle_ns > 0
+                            dt_ms_wall = (now_ns - context.state.last_cycle_ns) / 1_000_000.0
+                            dt_ms_stream = context.params.expected_symbol_ms > 0 ?
+                                           symbol_delta * context.params.expected_symbol_ms :
+                                           dt_ms_wall
+                            # Use stream-time (symbol count) for cycle validation to avoid
+                            # false outliers caused by upstream receive stalls.
+                            dt_ms_raw = dt_ms_stream
                             dt_ms = dt_ms_raw
                             fold = 1
                             outlier = false
-                            warmup = context.warmup_cycles_left > 0
+                            warmup = context.state.warmup_cycles_left > 0
                             if warmup
-                                context.warmup_cycles_left -= 1
-                                context.good_cycle_streak = 0
-                                context.ref_update_hold = true
+                                context.state.warmup_cycles_left -= 1
+                                context.state.good_cycle_streak = 0
+                                context.state.ref_update_hold = true
                                 skip_ref_update = true
                                 println("ISDBTFrameSync: frame_cycle_warmup_ms=",
                                         round(dt_ms_raw, digits = 3),
+                                        " wall_ms=",
+                                        round(dt_ms_wall, digits = 3),
                                         " symbols=",
                                         symbol_delta,
                                         " left=",
-                                        context.warmup_cycles_left,
+                                        context.state.warmup_cycles_left,
                                         " locked=",
-                                        context.locked)
-                            elseif context.expected_frame_ms > 0
-                                err = abs(dt_ms - context.expected_frame_ms) / context.expected_frame_ms
-                                if err > context.cycle_outlier_ratio && context.max_cycle_fold >= 2
-                                    fold_cand = round(Int, dt_ms_raw / context.expected_frame_ms)
-                                    if fold_cand >= 2 && fold_cand <= context.max_cycle_fold
+                                        context.state.locked)
+                            elseif context.params.expected_frame_ms > 0
+                                err = abs(dt_ms - context.params.expected_frame_ms) / context.params.expected_frame_ms
+                                if err > context.params.cycle_outlier_ratio && context.params.max_cycle_fold >= 2
+                                    fold_cand = round(Int, dt_ms_raw / context.params.expected_frame_ms)
+                                    if fold_cand >= 2 && fold_cand <= context.params.max_cycle_fold
                                         dt_fold = dt_ms_raw / fold_cand
-                                        err_fold = abs(dt_fold - context.expected_frame_ms) / context.expected_frame_ms
+                                        err_fold = abs(dt_fold - context.params.expected_frame_ms) / context.params.expected_frame_ms
                                         if err_fold < err
                                             dt_ms = dt_fold
                                             err = err_fold
@@ -272,46 +337,58 @@ function task!(context::ISDBTFrameSyncContext)
                                         end
                                     end
                                 end
-                                outlier = err > context.cycle_outlier_ratio
+                                outlier = err > context.params.cycle_outlier_ratio
+                                if !outlier && context.state.cycle_count > 4 && context.state.cycle_ema_ms > 0
+                                    ema_err = abs(dt_ms - context.state.cycle_ema_ms) / context.state.cycle_ema_ms
+                                    outlier = ema_err > context.params.cycle_ema_outlier_ratio
+                                end
                             end
                             if !warmup && !outlier
-                                context.outlier_streak = 0
-                                if context.cycle_count == 0
-                                    context.cycle_ema_ms = dt_ms
+                                context.state.outlier_streak = 0
+                                if context.state.cycle_count == 0
+                                    context.state.cycle_ema_ms = dt_ms
                                 else
-                                    context.cycle_ema_ms = 0.2 * dt_ms + 0.8 * context.cycle_ema_ms
+                                    context.state.cycle_ema_ms = 0.2 * dt_ms + 0.8 * context.state.cycle_ema_ms
                                 end
-                                context.cycle_count += 1
-                                context.good_cycle_streak += 1
-                                if context.good_cycle_streak >= context.ref_release_good_cycles
-                                    context.ref_update_hold = false
+                                context.state.cycle_count += 1
+                                context.state.good_cycle_streak += 1
+                                if context.state.good_cycle_streak >= context.params.ref_release_good_cycles
+                                    context.state.ref_update_hold = false
                                 else
-                                    context.ref_update_hold = true
+                                    context.state.ref_update_hold = true
                                     skip_ref_update = true
                                 end
-                                println("ISDBTFrameSync: frame_cycle_ms=",
-                                        round(dt_ms, digits = 3),
-                                        " raw_ms=",
-                                        round(dt_ms_raw, digits = 3),
-                                        " symbols=",
-                                        symbol_delta,
-                                        " fold=",
-                                        fold,
-                                        " good_streak=",
-                                        context.good_cycle_streak,
-                                        " ref_hold=",
-                                        context.ref_update_hold,
-                                        " ema_ms=",
-                                        round(context.cycle_ema_ms, digits = 3),
-                                        " locked=",
-                                        context.locked)
+                                context.logs.cycle_log_count += 1
+                                if context.logs.cycle_log_count >= context.logs.cycle_log_interval
+                                    context.logs.cycle_log_count = 0
+                                    println("ISDBTFrameSync: frame_cycle_ms=",
+                                            round(dt_ms, digits = 3),
+                                            " raw_stream_ms=",
+                                            round(dt_ms_raw, digits = 3),
+                                            " wall_ms=",
+                                            round(dt_ms_wall, digits = 3),
+                                            " symbols=",
+                                            symbol_delta,
+                                            " fold=",
+                                            fold,
+                                            " good_streak=",
+                                            context.state.good_cycle_streak,
+                                            " ref_hold=",
+                                            context.state.ref_update_hold,
+                                            " ema_ms=",
+                                            round(context.state.cycle_ema_ms, digits = 3),
+                                            " locked=",
+                                            context.state.locked)
+                                end
                             elseif !warmup
-                                context.outlier_streak += 1
-                                context.good_cycle_streak = 0
-                                context.ref_update_hold = true
+                                context.state.outlier_streak += 1
+                                context.state.good_cycle_streak = 0
+                                context.state.ref_update_hold = true
                                 skip_ref_update = true
                                 println("ISDBTFrameSync: frame_cycle_outlier_ms=",
-                                        round(dt_ms_raw, digits = 3),
+                                        round(dt_ms_stream, digits = 3),
+                                        " wall_ms=",
+                                        round(dt_ms_wall, digits = 3),
                                         " eval_ms=",
                                         round(dt_ms, digits = 3),
                                         " symbols=",
@@ -319,37 +396,37 @@ function task!(context::ISDBTFrameSyncContext)
                                         " fold=",
                                         fold,
                                         " expected_ms=",
-                                        round(context.expected_frame_ms, digits = 3),
+                                        round(context.params.expected_frame_ms, digits = 3),
                                         " streak=",
-                                        context.outlier_streak,
+                                        context.state.outlier_streak,
                                         " locked=",
-                                        context.locked)
-                                if context.outlier_streak >= context.outlier_relock_count
-                                    context.forced_resync_count += 1
-                                    context.symbol_index = 0
+                                        context.state.locked)
+                                if context.state.outlier_streak >= context.params.outlier_relock_count
+                                    context.state.forced_resync_count += 1
+                                    context.state.symbol_index = 0
                                     context.symbol_index_ref[] = 0
-                                    context.last_cycle_ns = 0
-                                    context.cycle_count = 0
-                                    context.cycle_ema_ms = 0.0
-                                    context.lock_age = 0
-                                    context.outlier_streak = 0
-                                    context.warmup_cycles_left = context.warmup_cycle_count
-                                    context.good_cycle_streak = 0
-                                    context.ref_update_hold = true
+                                    context.state.last_cycle_ns = 0
+                                    context.state.cycle_count = 0
+                                    context.state.cycle_ema_ms = 0.0
+                                    context.state.lock_age = 0
+                                    context.state.outlier_streak = 0
+                                    context.state.warmup_cycles_left = context.params.warmup_cycle_count
+                                    context.state.good_cycle_streak = 0
+                                    context.state.ref_update_hold = true
                                     println("ISDBTFrameSync: forced_resync count=",
-                                            context.forced_resync_count,
+                                            context.state.forced_resync_count,
                                             " reason=cycle_outlier")
                                 end
                             end
                         end
-                        context.last_cycle_ns = now_ns
+                        context.state.last_cycle_ns = now_ns
                     end
-                    if context.locked
-                        context.lock_age += 1
+                    if context.state.locked
+                        context.state.lock_age += 1
                     end
                     # Keep phase running even when unlocked; skip ref update on outlier cycle.
-                    if !skip_ref_update && !context.ref_update_hold
-                        context.symbol_index_ref[] = context.symbol_index
+                    if !skip_ref_update && !context.state.ref_update_hold
+                        context.symbol_index_ref[] = context.state.symbol_index
                     end
 
                     copyto!(context.outbuf, 1, rd_buffer.buf, 1, context.nfft)
@@ -392,8 +469,8 @@ function input!(context::ISDBTFrameSyncContext, samples::AbstractVector{ComplexF
     while !isready(context.ringbuffer.freeQ) && context.running[]
         wait_loops += 1
         if wait_loops == 2000
-            context.input_overrun_count += 1
-            println("ISDBTFrameSync: input_backpressure count=", context.input_overrun_count)
+            context.state.input_overrun_count += 1
+            println("ISDBTFrameSync: input_backpressure count=", context.state.input_overrun_count)
             wait_loops = 0
         end
         yield()
@@ -406,21 +483,53 @@ function input!(context::ISDBTFrameSyncContext, samples::AbstractVector{ComplexF
     copyto!(buf.buf, 1, samples, 1, actual_size)
     buf.store_size = actual_size
     put!(context.ringbuffer.fullQ, idx)
-    if context.expected_symbol_ms > 0
+    if context.params.expected_symbol_ms > 0
         now_ns = time_ns()
-        if context.last_input_ns > 0
-            gap_ms = (now_ns - context.last_input_ns) / 1_000_000.0
-            if gap_ms > context.expected_symbol_ms * context.input_gap_threshold_ratio
-                context.input_gap_count += 1
-                println("ISDBTFrameSync: input_gap_ms=",
-                        round(gap_ms, digits = 3),
-                        " expected_symbol_ms=",
-                        round(context.expected_symbol_ms, digits = 3),
-                        " count=",
-                        context.input_gap_count)
+        if context.state.last_input_ns > 0
+            gap_ms = (now_ns - context.state.last_input_ns) / 1_000_000.0
+            gap_thresh_ms = max(context.params.expected_symbol_ms * context.params.input_gap_threshold_ratio,
+                                context.params.gap_freeze_min_ms)
+            if gap_ms > gap_thresh_ms
+                context.state.input_gap_count += 1
+                # Gap-aware freeze extension: longer upstream stalls get longer hold.
+                # This keeps reference updates from being contaminated right after bursts.
+                burst_freeze = 0
+                if context.params.expected_symbol_ms > 0
+                    burst_freeze = ceil(Int, gap_ms / context.params.expected_symbol_ms)
+                end
+                freeze_set = max(context.params.gap_freeze_symbols, burst_freeze)
+                freeze_set = min(freeze_set, context.frame_symbols)
+                if freeze_set > 0
+                    context.state.gap_freeze_countdown = max(context.state.gap_freeze_countdown, freeze_set)
+                end
+                now_s = time()
+                if context.logs.last_input_gap_log_time == 0.0 ||
+                   (now_s - context.logs.last_input_gap_log_time) >= context.logs.input_gap_log_interval_sec
+                    burst = burst_freeze > context.params.gap_freeze_symbols
+                    println("ISDBTFrameSync: input_gap_ms=",
+                            round(gap_ms, digits = 3),
+                            " expected_symbol_ms=",
+                            round(context.params.expected_symbol_ms, digits = 3),
+                            " freeze_thresh_ms=",
+                            round(gap_thresh_ms, digits = 3),
+                            " burst=",
+                            burst,
+                            " freeze_set=",
+                            freeze_set,
+                            " count=",
+                            context.state.input_gap_count,
+                            " freeze_left=",
+                            context.state.gap_freeze_countdown,
+                            " suppressed=",
+                            context.logs.input_gap_suppressed)
+                    context.logs.last_input_gap_log_time = now_s
+                    context.logs.input_gap_suppressed = 0
+                else
+                    context.logs.input_gap_suppressed += 1
+                end
             end
         end
-        context.last_input_ns = now_ns
+        context.state.last_input_ns = now_ns
     end
 
     return samples_size

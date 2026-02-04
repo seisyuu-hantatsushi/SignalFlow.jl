@@ -17,6 +17,8 @@ mutable struct ViewContext <: SignalFlowBlock
     update_task::Union{Nothing,Task}
     update_interval::Int
     update_count::Int
+    drop_count::Int
+    drop_log_interval::Int
     ringbuffer::RingFrameBuffer{ComplexF32}
     holdbuf::Union{Nothing, Int}
     result_ringbuffer::RingFrameBuffer{Point2f}
@@ -46,12 +48,14 @@ function CreateView(inputSamplingRate::UInt64;
                     axis_limit::Real = 1.2,
                     title::AbstractString = "Constellation View",
                     update_interval::Int = 1,
+                    drop_log_interval::Int = 500,
                     window_size = (700, 700))
 
     frame_size < 1 && error("ConstellationView: frame_size must be at least 1.")
     poolsize < 1 && error("ConstellationView: poolsize must be at least 1.")
     axis_limit <= 0 && error("ConstellationView: axis_limit must be positive.")
     update_interval < 1 && error("ConstellationView: update_interval must be >= 1.")
+    drop_log_interval < 1 && error("ConstellationView: drop_log_interval must be >= 1.")
 
     _ = inputSamplingRate
 
@@ -94,6 +98,8 @@ function CreateView(inputSamplingRate::UInt64;
                        nothing,
                        update_interval,
                        0,
+                       0,
+                       drop_log_interval,
                        RingFrameBuffer(ComplexF32, frame_size, poolsize),
                        nothing,
                        result_ringbuffer)
@@ -173,7 +179,12 @@ function input!(context::ViewContext, samples::AbstractVector{ComplexF32}, sampl
         end
 
         if context.holdbuf == nothing
-            return -1
+            # Drop newest visualization input if view queue is busy to avoid backpressure.
+            context.drop_count += 1
+            if (context.drop_count % context.drop_log_interval) == 0
+                println("ConstellationView: dropped_frames=", context.drop_count)
+            end
+            return samples_size
         else
             write_frame = context.ringbuffer.bufs[context.holdbuf]
             copy_size = min(remain_size, context.ringbuffer.frame_size - write_frame.store_size)
