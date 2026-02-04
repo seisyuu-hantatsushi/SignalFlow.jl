@@ -3,6 +3,7 @@ module TMCCDBPSKDecoder
 import ..SignalFlowBlock
 import ..input!
 import ..RingBuffers: RingFrameBuffer
+import ..AsyncLogger
 
 mutable struct TMCCDBPSKDecoderContext <: SignalFlowBlock
     running::Base.Threads.Atomic{Bool}
@@ -53,17 +54,13 @@ mutable struct TMCCDBPSKDecoderContext <: SignalFlowBlock
     sinks::Vector{SignalFlowBlock}
 end
 
-const LOG_LOCK = ReentrantLock()
-
 @inline function phase_distance(a::Int, b::Int, period::Int)
     d = abs(a - b)
     return min(d, period - d)
 end
 
 @inline function atomic_log_line(msg::AbstractString)
-    lock(LOG_LOCK) do
-        print(stdout, msg, '\n')
-    end
+    AsyncLogger.log_async(msg)
 end
 
 function CreateTMCCDBPSKDecoder(; nfft::Int = 8192,
@@ -407,7 +404,7 @@ function task!(context::TMCCDBPSKDecoderContext)
         end
     catch e
         if !(e isa InterruptException)
-            println("TMCCDBPSKDecoder error: ", e)
+            AsyncLogger.log_async("TMCCDBPSKDecoder error: ", e)
         end
     end
     return nothing

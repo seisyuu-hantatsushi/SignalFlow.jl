@@ -4,6 +4,7 @@ abstract type SignalFlowBlock end
 function input! end
 
 include("RingBuffers.jl")
+include("AsyncLogger.jl")
 include("ADFMCOMMS2Src.jl")
 include("ISDBTPRBS.jl")
 include("ISDBTSymbolSync.jl")

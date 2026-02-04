@@ -3,6 +3,7 @@ module ConstellationView
 import ..SignalFlowBlock
 import ..input!
 import ..RingBuffers: RingFrameBuffer
+import ..AsyncLogger
 
 using GLMakie
 
@@ -135,7 +136,7 @@ function task!(context::ViewContext)
         end
     catch e
         if !(e isa InterruptException)
-            println("ConstellationView task error: ", e)
+            AsyncLogger.log_async("ConstellationView task error: ", e)
         end
     end
     return nothing
@@ -156,7 +157,7 @@ function update_task!(context::ViewContext)
         end
     catch e
         if !(e isa InterruptException)
-            println("ConstellationView update error: ", e)
+            AsyncLogger.log_async("ConstellationView update error: ", e)
         end
     end
     return nothing
@@ -182,7 +183,7 @@ function input!(context::ViewContext, samples::AbstractVector{ComplexF32}, sampl
             # Drop newest visualization input if view queue is busy to avoid backpressure.
             context.drop_count += 1
             if (context.drop_count % context.drop_log_interval) == 0
-                println("ConstellationView: dropped_frames=", context.drop_count)
+                AsyncLogger.log_async("ConstellationView: dropped_frames=", context.drop_count)
             end
             return samples_size
         else
@@ -202,7 +203,7 @@ function input!(context::ViewContext, samples::AbstractVector{ComplexF32}, sampl
 end
 
 function stop!(context::ViewContext)
-    println("ConstellationView.stop()")
+    AsyncLogger.log_async("ConstellationView.stop()")
     context.running[] = false
     wait(context.worker)
     wait(context.update_task)

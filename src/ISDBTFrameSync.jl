@@ -3,6 +3,7 @@ module ISDBTFrameSync
 import ..SignalFlowBlock
 import ..input!
 import ..RingBuffers: RingFrameBuffer
+import ..AsyncLogger
 
 struct ISDBTFrameSyncParams
     lock_threshold::Float64
@@ -242,7 +243,7 @@ function task!(context::ISDBTFrameSyncContext)
                         context.logs.log_count += 1
                         if context.logs.log_count >= context.logs.log_interval
                             context.logs.log_count = 0
-                            println("ISDBTFrameSync: corr=", corr,
+                            AsyncLogger.log_async("ISDBTFrameSync: corr=", corr,
                                     " ema=", round(metric, digits = 4),
                                     " locked=", context.state.locked)
                         end
@@ -273,12 +274,12 @@ function task!(context::ISDBTFrameSyncContext)
                             context.state.warmup_cycles_left = context.params.warmup_cycle_count
                             context.state.good_cycle_streak = 0
                             context.state.ref_update_hold = true
-                            println("ISDBTFrameSync: lock corr=", corr, " ema=", round(metric, digits = 4))
+                            AsyncLogger.log_async("ISDBTFrameSync: lock corr=", corr, " ema=", round(metric, digits = 4))
                         elseif context.state.locked && context.state.unlock_count >= context.params.unlock_confirm
                             context.state.locked = false
                             context.state.lock_age = 0
                             context.state.ref_update_hold = true
-                            println("ISDBTFrameSync: unlock corr=", corr, " ema=", round(metric, digits = 4))
+                            AsyncLogger.log_async("ISDBTFrameSync: unlock corr=", corr, " ema=", round(metric, digits = 4))
                         end
                     end
 
@@ -313,7 +314,7 @@ function task!(context::ISDBTFrameSyncContext)
                                 context.state.good_cycle_streak = 0
                                 context.state.ref_update_hold = true
                                 skip_ref_update = true
-                                println("ISDBTFrameSync: frame_cycle_warmup_ms=",
+                                AsyncLogger.log_async("ISDBTFrameSync: frame_cycle_warmup_ms=",
                                         round(dt_ms_raw, digits = 3),
                                         " wall_ms=",
                                         round(dt_ms_wall, digits = 3),
@@ -361,7 +362,7 @@ function task!(context::ISDBTFrameSyncContext)
                                 context.logs.cycle_log_count += 1
                                 if context.logs.cycle_log_count >= context.logs.cycle_log_interval
                                     context.logs.cycle_log_count = 0
-                                    println("ISDBTFrameSync: frame_cycle_ms=",
+                                    AsyncLogger.log_async("ISDBTFrameSync: frame_cycle_ms=",
                                             round(dt_ms, digits = 3),
                                             " raw_stream_ms=",
                                             round(dt_ms_raw, digits = 3),
@@ -385,7 +386,7 @@ function task!(context::ISDBTFrameSyncContext)
                                 context.state.good_cycle_streak = 0
                                 context.state.ref_update_hold = true
                                 skip_ref_update = true
-                                println("ISDBTFrameSync: frame_cycle_outlier_ms=",
+                                AsyncLogger.log_async("ISDBTFrameSync: frame_cycle_outlier_ms=",
                                         round(dt_ms_stream, digits = 3),
                                         " wall_ms=",
                                         round(dt_ms_wall, digits = 3),
@@ -413,7 +414,7 @@ function task!(context::ISDBTFrameSyncContext)
                                     context.state.warmup_cycles_left = context.params.warmup_cycle_count
                                     context.state.good_cycle_streak = 0
                                     context.state.ref_update_hold = true
-                                    println("ISDBTFrameSync: forced_resync count=",
+                                    AsyncLogger.log_async("ISDBTFrameSync: forced_resync count=",
                                             context.state.forced_resync_count,
                                             " reason=cycle_outlier")
                                 end
@@ -445,7 +446,7 @@ function task!(context::ISDBTFrameSyncContext)
         end
     catch e
         if !(e isa InterruptException)
-            println("ISDBTFrameSync error: ", e)
+            AsyncLogger.log_async("ISDBTFrameSync error: ", e)
         end
     end
     return nothing
@@ -470,7 +471,7 @@ function input!(context::ISDBTFrameSyncContext, samples::AbstractVector{ComplexF
         wait_loops += 1
         if wait_loops == 2000
             context.state.input_overrun_count += 1
-            println("ISDBTFrameSync: input_backpressure count=", context.state.input_overrun_count)
+            AsyncLogger.log_async("ISDBTFrameSync: input_backpressure count=", context.state.input_overrun_count)
             wait_loops = 0
         end
         yield()
@@ -506,7 +507,7 @@ function input!(context::ISDBTFrameSyncContext, samples::AbstractVector{ComplexF
                 if context.logs.last_input_gap_log_time == 0.0 ||
                    (now_s - context.logs.last_input_gap_log_time) >= context.logs.input_gap_log_interval_sec
                     burst = burst_freeze > context.params.gap_freeze_symbols
-                    println("ISDBTFrameSync: input_gap_ms=",
+                    AsyncLogger.log_async("ISDBTFrameSync: input_gap_ms=",
                             round(gap_ms, digits = 3),
                             " expected_symbol_ms=",
                             round(context.params.expected_symbol_ms, digits = 3),

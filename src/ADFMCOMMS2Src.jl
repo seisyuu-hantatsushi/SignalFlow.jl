@@ -5,6 +5,7 @@ using ADFMCOMMS2
 import ..SignalFlowBlock
 import ..input!
 import ..RingBuffers: RingFrameBuffer
+import ..AsyncLogger
 
 mutable struct ADFMCOMMS2Src{T} <: SignalFlowBlock 
     running::Base.Threads.Atomic{Bool}
@@ -109,14 +110,14 @@ end
         return nothing
     end
     recent_min_ms, recent_mean_ms, recent_max_ms, recent_n = recent_gap_summary(stats)
-    println("recv gap burst: gap_ms=", round(Float64(gap_ns) / 1_000_000, digits = 3),
-            " recent_mean_ms=", round(recent_mean_ms, digits = 3),
-            " recent_min_ms=", round(recent_min_ms, digits = 3),
-            " recent_max_ms=", round(recent_max_ms, digits = 3),
-            " recent_n=", recent_n,
-            " over10=", stats.over_10ms,
-            " over20=", stats.over_20ms,
-            " over40=", stats.over_40ms)
+    AsyncLogger.log_async("recv gap burst: gap_ms=", round(Float64(gap_ns) / 1_000_000, digits = 3),
+                          " recent_mean_ms=", round(recent_mean_ms, digits = 3),
+                          " recent_min_ms=", round(recent_min_ms, digits = 3),
+                          " recent_max_ms=", round(recent_max_ms, digits = 3),
+                          " recent_n=", recent_n,
+                          " over10=", stats.over_10ms,
+                          " over20=", stats.over_20ms,
+                          " over40=", stats.over_40ms)
     stats.last_burst_log_ns = now_ns
     return nothing
 end
@@ -270,12 +271,12 @@ function recv_task!(context::ADFMCOMMS2Src{T}) where {T}
                     idx = take!(context.ringbuffer.fullQ)
                     context.dropped_frame_count += 1
                     if (context.dropped_frame_count % context.backpressure_log_interval) == 0
-                        println("ADFMCOMMS2Src: dropped_backpressure_frames=", context.dropped_frame_count)
+                        AsyncLogger.log_async("ADFMCOMMS2Src: dropped_backpressure_frames=", context.dropped_frame_count)
                     end
                 else
                     context.recv_overrun_count += 1
                     if (context.recv_overrun_count % context.backpressure_log_interval) == 0
-                        println("ADFMCOMMS2Src: recv_backpressure count=", context.recv_overrun_count)
+                        AsyncLogger.log_async("ADFMCOMMS2Src: recv_backpressure count=", context.recv_overrun_count)
                     end
                     yield()
                     continue
@@ -291,26 +292,26 @@ function recv_task!(context::ADFMCOMMS2Src{T}) where {T}
             if now_time - prev_time >= 1_000_000_000
                 diff_time = Float32(now_time - prev_time)/1000_000_000
                 diff_samples = total_recv_samples - prev_total_recv_samples
-                println("recv rate: ",Float32(diff_samples)/diff_time, "S/sec")
+                AsyncLogger.log_async("recv rate: ",Float32(diff_samples)/diff_time, "S/sec")
                 diff_samples_u = max(diff_samples, UInt64(1))
                 clip_ratio = Float64(clip_count) / Float64(diff_samples_u)
                 peak_norm = clip_peak / max(sample_fullscale(T), tiny_eps)
-                println("recv clip: ratio=", round(clip_ratio, digits = 6),
-                        " peak_norm=", round(peak_norm, digits = 4),
-                        " threshold=", round(clip_threshold / max(sample_fullscale(T), tiny_eps), digits = 3))
+                AsyncLogger.log_async("recv clip: ratio=", round(clip_ratio, digits = 6),
+                                      " peak_norm=", round(peak_norm, digits = 4),
+                                      " threshold=", round(clip_threshold / max(sample_fullscale(T), tiny_eps), digits = 3))
                 if recv_gap_stats.count > 0
                     gap_mean_ms = (Float64(recv_gap_stats.sum_gap_ns) / recv_gap_stats.count) / 1_000_000
                     gap_max_ms = Float64(recv_gap_stats.max_gap_ns) / 1_000_000
-                    println("recv gap: mean_ms=", round(gap_mean_ms, digits = 3),
-                            " max_ms=", round(gap_max_ms, digits = 3),
-                            " over10=", recv_gap_stats.over_10ms,
-                            " over20=", recv_gap_stats.over_20ms,
-                            " over40=", recv_gap_stats.over_40ms,
-                            " n=", recv_gap_stats.count)
+                    AsyncLogger.log_async("recv gap: mean_ms=", round(gap_mean_ms, digits = 3),
+                                          " max_ms=", round(gap_max_ms, digits = 3),
+                                          " over10=", recv_gap_stats.over_10ms,
+                                          " over20=", recv_gap_stats.over_20ms,
+                                          " over40=", recv_gap_stats.over_40ms,
+                                          " n=", recv_gap_stats.count)
                 end
                 dropped_delta = context.dropped_frame_count - prev_dropped_frames
                 if dropped_delta > 0
-                    println("recv drop: frames=", dropped_delta, " total=", context.dropped_frame_count)
+                    AsyncLogger.log_async("recv drop: frames=", dropped_delta, " total=", context.dropped_frame_count)
                 end
                 prev_time = now_time
                 prev_total_recv_samples = total_recv_samples
@@ -322,7 +323,7 @@ function recv_task!(context::ADFMCOMMS2Src{T}) where {T}
         end
         
     catch e
-        println("ADFMCOMMS2Src error: ", e)
+        AsyncLogger.log_async("ADFMCOMMS2Src error: ", e)
     end
     ADFMCOMMS2.stop!(context.adapter)
 end
@@ -357,7 +358,7 @@ function dispatch_task!(context::ADFMCOMMS2Src{T}, dispatch_burst::Int) where {T
         end
     catch e
         if !(e isa InterruptException)
-            println("ADFMCOMMS2Src dispatch error: ", e)
+            AsyncLogger.log_async("ADFMCOMMS2Src dispatch error: ", e)
         end
     end
     return nothing
