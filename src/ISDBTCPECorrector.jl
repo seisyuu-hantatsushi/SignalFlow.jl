@@ -22,12 +22,15 @@ mutable struct ISDBTCPECorrectorContext <: SignalFlowBlock
     cpe_max_step::Float64
     pilot_min_mag::Float64
     pilot_trim_ratio::Float64
-    min_update_conf::Float64
+    min_update_conf_on::Float64
+    min_update_conf_off::Float64
+    update_enabled::Bool
     auto_sp_phase::Bool
     auto_sp_phase_interval::Int
     auto_phase_countdown::Int
     selected_phase::Int
     symbol_index_ref::Union{Nothing,Base.Threads.Atomic{Int}}
+    gap_freeze_ref::Union{Nothing,Base.Threads.Atomic{Int}}
     cpe_phase::Float64
     log_stats::Bool
     log_interval::Float64
@@ -132,9 +135,11 @@ function CreateISDBTCPECorrector(; nfft::Int = 8192,
                                  pilot_min_mag::Real = 0.15,
                                  pilot_trim_ratio::Real = 0.2,
                                  min_update_conf::Real = 0.2,
+                                 min_update_conf_off::Union{Nothing,Real} = nothing,
                                  auto_sp_phase::Bool = true,
                                  auto_sp_phase_interval::Int = 4,
                                  symbol_index_ref::Union{Nothing,Base.Threads.Atomic{Int}} = nothing,
+                                 gap_freeze_ref::Union{Nothing,Base.Threads.Atomic{Int}} = nothing,
                                  log_stats::Bool = false,
                                  log_interval::Real = 1.0,
                                  poolsize::Int = 8)
@@ -148,6 +153,9 @@ function CreateISDBTCPECorrector(; nfft::Int = 8192,
     auto_sp_phase_interval < 1 && error("ISDBTCPECorrector: auto_sp_phase_interval must be >= 1.")
     poolsize < 1 && error("ISDBTCPECorrector: poolsize must be at least 1.")
     log_interval <= 0 && error("ISDBTCPECorrector: log_interval must be > 0.")
+    update_conf_on = Float64(min_update_conf)
+    update_conf_off = min_update_conf_off === nothing ? max(0.0, update_conf_on * 0.7) : Float64(min_update_conf_off)
+    (0.0 <= update_conf_off <= update_conf_on <= 1.0) || error("ISDBTCPECorrector: require 0 <= min_update_conf_off <= min_update_conf <= 1.")
 
     pos = segment_carriers > 0 ?
           seg0_pilot_bins(nfft, pilot_spacing, pilot_offset0, segment_carriers) :
@@ -184,12 +192,15 @@ function CreateISDBTCPECorrector(; nfft::Int = 8192,
                                    Float64(cpe_max_step_deg) * Float64(pi) / 180.0,
                                    Float64(pilot_min_mag),
                                    Float64(pilot_trim_ratio),
-                                   Float64(min_update_conf),
+                                   update_conf_on,
+                                   update_conf_off,
+                                   false,
                                    auto_sp_phase,
                                    auto_sp_phase_interval,
                                    0,
                                    1,
                                    symbol_index_ref,
+                                   gap_freeze_ref,
                                    0.0,
                                    log_stats,
                                    Float64(log_interval),
@@ -272,7 +283,17 @@ function task!(context::ISDBTCPECorrectorContext)
                     end
                     conf = mag_sum > 0 ? sqrt(s_re * s_re + s_im * s_im) / mag_sum : 0.0
                     updated = false
-                    if used > 0 && conf >= context.min_update_conf
+                    freeze_active = context.gap_freeze_ref !== nothing && context.gap_freeze_ref[] > 0
+                    if freeze_active
+                        context.update_enabled = false
+                    elseif context.update_enabled
+                        if conf < context.min_update_conf_off
+                            context.update_enabled = false
+                        end
+                    elseif conf >= context.min_update_conf_on
+                        context.update_enabled = true
+                    end
+                    if used > 0 && context.update_enabled && !freeze_active
                         phi = atan(s_im, s_re)
                         if context.pilot_trim_ratio > 0 && used >= 8
                             @inbounds for i in 1:used
@@ -304,7 +325,7 @@ function task!(context::ISDBTCPECorrectorContext)
                         end
                         err = wrap_phase(phi - context.cpe_phase)
                         # Low-confidence symbols update more conservatively to reduce phase jitter.
-                        conf_gain = clamp((conf - context.min_update_conf) / max(1e-6, 1.0 - context.min_update_conf), 0.2, 1.0)
+                        conf_gain = clamp((conf - context.min_update_conf_off) / max(1e-6, 1.0 - context.min_update_conf_off), 0.2, 1.0)
                         delta = context.cpe_alpha * conf_gain * err
                         if delta > context.cpe_max_step
                             delta = context.cpe_max_step
@@ -324,6 +345,7 @@ function task!(context::ISDBTCPECorrectorContext)
                                 println("CPE: phase=", round(deg, digits = 2),
                                         " deg conf=", round(conf, digits = 3),
                                         " used=", used, "/", length(band_pos),
+                                        " gate=", context.update_enabled,
                                         " updated=", updated)
                             end
                             context.last_log_time = now

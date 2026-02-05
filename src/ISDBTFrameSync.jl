@@ -5,6 +5,45 @@ import ..input!
 import ..RingBuffers: RingFrameBuffer
 import ..AsyncLogger
 
+struct ISDBTFrameSyncCoreConfig
+    nfft::Int
+    frame_symbols::Int
+    tmcc_bins::Vector{Int}
+    poolsize::Int
+end
+
+Base.@kwdef struct ISDBTFrameSyncLockConfig
+    lock_threshold::Float64 = 0.7
+    unlock_threshold::Float64 = 0.4
+    lock_confirm::Int = 5
+    unlock_confirm::Int = 5
+    min_lock_symbols::Int = 64
+    metric_guard_band::Float64 = 0.03
+    corr_alpha::Float64 = 0.2
+end
+
+Base.@kwdef struct ISDBTFrameSyncCycleConfig
+    expected_frame_ms::Float64 = 0.0
+    cycle_outlier_ratio::Float64 = 0.15
+    max_cycle_fold::Int = 4
+    outlier_relock_count::Int = 3
+    warmup_cycle_count::Int = 2
+    ref_release_good_cycles::Int = 2
+    cycle_ema_outlier_ratio::Float64 = 0.15
+end
+
+Base.@kwdef struct ISDBTFrameSyncGapConfig
+    input_gap_threshold_ratio::Float64 = 2.5
+    gap_freeze_min_ms::Float64 = 45.0
+    gap_freeze_symbols::Int = 8
+end
+
+Base.@kwdef struct ISDBTFrameSyncLogConfig
+    log_interval::Int = 200
+    cycle_log_interval::Int = 20
+    input_gap_log_interval_sec::Float64 = 1.0
+end
+
 struct ISDBTFrameSyncParams
     lock_threshold::Float64
     unlock_threshold::Float64
@@ -58,6 +97,8 @@ mutable struct ISDBTFrameSyncRuntime
     input_overrun_count::Int
     last_input_ns::Int64
     input_gap_count::Int
+    input_gap_event_streak::Int
+    input_gap_last_event_ns::Int64
 end
 
 mutable struct ISDBTFrameSyncContext <: SignalFlowBlock
@@ -69,6 +110,7 @@ mutable struct ISDBTFrameSyncContext <: SignalFlowBlock
     logs::ISDBTFrameSyncLogState
     state::ISDBTFrameSyncRuntime
     symbol_index_ref::Base.Threads.Atomic{Int}
+    gap_freeze_ref::Base.Threads.Atomic{Int}
     tmcc_ring::Vector{Vector{ComplexF32}}
     filled::Int
     outbuf::Vector{ComplexF32}
@@ -77,6 +119,37 @@ mutable struct ISDBTFrameSyncContext <: SignalFlowBlock
     worker::Union{Nothing,Task}
     new_sinks::Channel{SignalFlowBlock}
     sinks::Vector{SignalFlowBlock}
+end
+
+function CreateISDBTFrameSync(core::ISDBTFrameSyncCoreConfig;
+                              lock::ISDBTFrameSyncLockConfig = ISDBTFrameSyncLockConfig(),
+                              cycle::ISDBTFrameSyncCycleConfig = ISDBTFrameSyncCycleConfig(),
+                              gap::ISDBTFrameSyncGapConfig = ISDBTFrameSyncGapConfig(),
+                              log::ISDBTFrameSyncLogConfig = ISDBTFrameSyncLogConfig())
+    return CreateISDBTFrameSync(; nfft = core.nfft,
+                                frame_symbols = core.frame_symbols,
+                                tmcc_bins = core.tmcc_bins,
+                                poolsize = core.poolsize,
+                                lock_threshold = lock.lock_threshold,
+                                unlock_threshold = lock.unlock_threshold,
+                                lock_confirm = lock.lock_confirm,
+                                unlock_confirm = lock.unlock_confirm,
+                                min_lock_symbols = lock.min_lock_symbols,
+                                metric_guard_band = lock.metric_guard_band,
+                                corr_alpha = lock.corr_alpha,
+                                expected_frame_ms = cycle.expected_frame_ms,
+                                cycle_outlier_ratio = cycle.cycle_outlier_ratio,
+                                max_cycle_fold = cycle.max_cycle_fold,
+                                outlier_relock_count = cycle.outlier_relock_count,
+                                warmup_cycle_count = cycle.warmup_cycle_count,
+                                ref_release_good_cycles = cycle.ref_release_good_cycles,
+                                cycle_ema_outlier_ratio = cycle.cycle_ema_outlier_ratio,
+                                input_gap_threshold_ratio = gap.input_gap_threshold_ratio,
+                                gap_freeze_min_ms = gap.gap_freeze_min_ms,
+                                gap_freeze_symbols = gap.gap_freeze_symbols,
+                                log_interval = log.log_interval,
+                                cycle_log_interval = log.cycle_log_interval,
+                                input_gap_log_interval_sec = log.input_gap_log_interval_sec)
 end
 
 function CreateISDBTFrameSync(; nfft::Int = 8192,
@@ -177,6 +250,8 @@ function CreateISDBTFrameSync(; nfft::Int = 8192,
                                   0,
                                   0,
                                   0,
+                                  0,
+                                  0,
                                   0)
     ctx = ISDBTFrameSyncContext(Base.Threads.Atomic{Bool}(true),
                                 nfft,
@@ -185,6 +260,7 @@ function CreateISDBTFrameSync(; nfft::Int = 8192,
                                 params,
                                 logs,
                                 state,
+                                Base.Threads.Atomic{Int}(0),
                                 Base.Threads.Atomic{Int}(0),
                                 tmcc_ring,
                                 0,
@@ -228,6 +304,7 @@ function task!(context::ISDBTFrameSyncContext)
                         freeze_active = context.state.gap_freeze_countdown > 0
                         if freeze_active
                             context.state.gap_freeze_countdown -= 1
+                            context.gap_freeze_ref[] = context.state.gap_freeze_countdown
                         end
                         if !freeze_active && context.state.corr_ema_ready
                             context.state.corr_ema = context.params.corr_alpha * corr +
@@ -492,27 +569,49 @@ function input!(context::ISDBTFrameSyncContext, samples::AbstractVector{ComplexF
                                 context.params.gap_freeze_min_ms)
             if gap_ms > gap_thresh_ms
                 context.state.input_gap_count += 1
-                # Gap-aware freeze extension: longer upstream stalls get longer hold.
-                # This keeps reference updates from being contaminated right after bursts.
-                burst_freeze = 0
-                if context.params.expected_symbol_ms > 0
-                    burst_freeze = ceil(Int, gap_ms / context.params.expected_symbol_ms)
+                event_window_ns = Int64(250_000_000) # 250ms: treat nearby bursts as one event cluster
+                if context.state.input_gap_last_event_ns > 0 &&
+                   (now_ns - context.state.input_gap_last_event_ns) <= event_window_ns
+                    context.state.input_gap_event_streak += 1
+                else
+                    context.state.input_gap_event_streak = 1
                 end
-                freeze_set = max(context.params.gap_freeze_symbols, burst_freeze)
-                freeze_set = min(freeze_set, context.frame_symbols)
-                if freeze_set > 0
-                    context.state.gap_freeze_countdown = max(context.state.gap_freeze_countdown, freeze_set)
-                end
+                context.state.input_gap_last_event_ns = now_ns
+
+                # Guard isolated scheduler hiccups: freeze only on repeated bursts or clearly huge gaps.
+                huge_gap = gap_ms >= (2.0 * gap_thresh_ms)
+                apply_freeze = huge_gap || (context.state.input_gap_event_streak >= 2)
+                freeze_set = 0
+                    if apply_freeze
+                    # Gap-aware freeze extension: longer upstream stalls get longer hold.
+                    # This keeps reference updates from being contaminated right after bursts.
+                    burst_freeze = 0
+                    if context.params.expected_symbol_ms > 0
+                        burst_freeze = ceil(Int, gap_ms / context.params.expected_symbol_ms)
+                    end
+                    freeze_set = max(context.params.gap_freeze_symbols, burst_freeze)
+                    freeze_set = min(freeze_set, context.frame_symbols)
+                        if freeze_set > 0
+                            context.state.gap_freeze_countdown = max(context.state.gap_freeze_countdown, freeze_set)
+                            context.gap_freeze_ref[] = context.state.gap_freeze_countdown
+                        end
+                    end
                 now_s = time()
                 if context.logs.last_input_gap_log_time == 0.0 ||
                    (now_s - context.logs.last_input_gap_log_time) >= context.logs.input_gap_log_interval_sec
-                    burst = burst_freeze > context.params.gap_freeze_symbols
+                    burst = freeze_set > context.params.gap_freeze_symbols
                     AsyncLogger.log_async("ISDBTFrameSync: input_gap_ms=",
                             round(gap_ms, digits = 3),
                             " expected_symbol_ms=",
                             round(context.params.expected_symbol_ms, digits = 3),
                             " freeze_thresh_ms=",
                             round(gap_thresh_ms, digits = 3),
+                            " huge=",
+                            huge_gap,
+                            " streak=",
+                            context.state.input_gap_event_streak,
+                            " apply_freeze=",
+                            apply_freeze,
                             " burst=",
                             burst,
                             " freeze_set=",

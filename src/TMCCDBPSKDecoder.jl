@@ -33,6 +33,10 @@ mutable struct TMCCDBPSKDecoderContext <: SignalFlowBlock
     sync_locked::Bool
     sync_fine_locked::Bool
     sync_fine_threshold::Float64
+    sync_fine_unlock_threshold::Float64
+    sync_fine_alpha::Float64
+    sync_fine_metric::Float64
+    sync_fine_metric_ready::Bool
     sync_fine_confirm::Int
     sync_fine_count::Int
     sync_fine_fail_count::Int
@@ -78,6 +82,8 @@ function CreateTMCCDBPSKDecoder(; nfft::Int = 8192,
                                 sync_unlock_threshold::Real = 0.625,
                                 sync_lock_confirm::Int = 3,
                                 sync_fine_threshold::Real = 0.688,
+                                sync_fine_unlock_threshold::Real = 0.58,
+                                sync_fine_alpha::Real = 0.25,
                                 sync_fine_confirm::Int = 4,
                                 sync_fine_fail_tolerate::Int = 3,
                                 sync_phase_guard::Int = 1,
@@ -93,6 +99,10 @@ function CreateTMCCDBPSKDecoder(; nfft::Int = 8192,
     (0.0 <= sync_track_threshold <= 1.0) || error("TMCCDBPSKDecoder: sync_track_threshold must be in [0, 1].")
     (0.0 <= sync_unlock_threshold <= 1.0) || error("TMCCDBPSKDecoder: sync_unlock_threshold must be in [0, 1].")
     (0.0 <= sync_fine_threshold <= 1.0) || error("TMCCDBPSKDecoder: sync_fine_threshold must be in [0, 1].")
+    (0.0 <= sync_fine_unlock_threshold <= 1.0) || error("TMCCDBPSKDecoder: sync_fine_unlock_threshold must be in [0, 1].")
+    sync_fine_unlock_threshold > sync_fine_threshold &&
+        error("TMCCDBPSKDecoder: sync_fine_unlock_threshold must be <= sync_fine_threshold.")
+    (0.0 < sync_fine_alpha <= 1.0) || error("TMCCDBPSKDecoder: sync_fine_alpha must be in (0, 1].")
     sync_track_threshold < sync_acq_threshold && error("TMCCDBPSKDecoder: sync_track_threshold must be >= sync_acq_threshold.")
     sync_unlock_threshold > sync_acq_threshold && error("TMCCDBPSKDecoder: sync_unlock_threshold must be <= sync_acq_threshold.")
     sync_lock_confirm < 1 && error("TMCCDBPSKDecoder: sync_lock_confirm must be >= 1.")
@@ -150,6 +160,10 @@ function CreateTMCCDBPSKDecoder(; nfft::Int = 8192,
                                   false,
                                   false,
                                   Float64(sync_fine_threshold),
+                                  Float64(sync_fine_unlock_threshold),
+                                  Float64(sync_fine_alpha),
+                                  0.0,
+                                  false,
                                   Int(sync_fine_confirm),
                                   0,
                                   0,
@@ -338,10 +352,18 @@ function task!(context::TMCCDBPSKDecoderContext)
                                     head_symbol = context.symbol_counter - swlen + 1
                                     phase_now = mod(head_symbol, context.frame_symbols)
                                     phase_now == 0 && (phase_now = context.frame_symbols)
-                                    phase_ok = phase_distance(phase_now, context.sync_phase, context.frame_symbols) <= 2
+                                    phase_ok = phase_distance(phase_now, context.sync_phase, context.frame_symbols) <= 1
                                     word_ok = (length(context.sync_words) <= 1) || (best_w == context.sync_expect_word)
                                     carrier_ok = best_car == context.sync_carrier
-                                    if phase_ok && score >= context.sync_fine_threshold
+                                    if context.sync_fine_metric_ready
+                                        context.sync_fine_metric = context.sync_fine_alpha * score +
+                                                                   (1.0 - context.sync_fine_alpha) * context.sync_fine_metric
+                                    else
+                                        context.sync_fine_metric = score
+                                        context.sync_fine_metric_ready = true
+                                    end
+                                    fine_metric = context.sync_fine_metric
+                                    if phase_ok && fine_metric >= context.sync_fine_threshold
                                         delta = 1
                                         word_ok && (delta += 1)
                                         carrier_ok && (delta += 1)
@@ -349,11 +371,14 @@ function task!(context::TMCCDBPSKDecoderContext)
                                                                       context.sync_fine_confirm * 4)
                                         context.sync_fine_fail_count = 0
                                     else
-                                        # Decay only after consecutive misses, improving fine-lock hold.
-                                        context.sync_fine_fail_count += 1
-                                        if context.sync_fine_fail_count >= context.sync_fine_fail_tolerate
-                                            context.sync_fine_count = max(context.sync_fine_count - 1, 0)
-                                            context.sync_fine_fail_count = 0
+                                        # Hysteresis: only treat as hard miss when metric drops well below threshold.
+                                        hard_miss = (!phase_ok) || (fine_metric < context.sync_fine_unlock_threshold)
+                                        if hard_miss || !(word_ok && carrier_ok)
+                                            context.sync_fine_fail_count += 1
+                                            if context.sync_fine_fail_count >= context.sync_fine_fail_tolerate
+                                                context.sync_fine_count = max(context.sync_fine_count - 1, 0)
+                                                context.sync_fine_fail_count = 0
+                                            end
                                         end
                                     end
                                     context.sync_fine_locked = context.sync_fine_count >= context.sync_fine_confirm
@@ -361,6 +386,8 @@ function task!(context::TMCCDBPSKDecoderContext)
                                     context.sync_fine_locked = false
                                     context.sync_fine_count = 0
                                     context.sync_fine_fail_count = 0
+                                    context.sync_fine_metric = 0.0
+                                    context.sync_fine_metric_ready = false
                                 end
                             end
                         end

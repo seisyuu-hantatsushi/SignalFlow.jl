@@ -35,6 +35,40 @@ mutable struct RecvGapStats
     last_burst_log_ns::Int64
 end
 
+mutable struct DispatchSinkStats
+    calls::Int
+    total_ns::Int64
+    max_ns::Int64
+    over_1ms::Int
+    over_5ms::Int
+end
+
+DispatchSinkStats() = DispatchSinkStats(0, 0, 0, 0, 0)
+
+@inline function update_dispatch_sink_stats!(stats::DispatchSinkStats, elapsed_ns::Int64)
+    stats.calls += 1
+    stats.total_ns += elapsed_ns
+    if elapsed_ns > stats.max_ns
+        stats.max_ns = elapsed_ns
+    end
+    if elapsed_ns >= 1_000_000
+        stats.over_1ms += 1
+    end
+    if elapsed_ns >= 5_000_000
+        stats.over_5ms += 1
+    end
+    return nothing
+end
+
+@inline function reset_dispatch_sink_stats!(stats::DispatchSinkStats)
+    stats.calls = 0
+    stats.total_ns = 0
+    stats.max_ns = 0
+    stats.over_1ms = 0
+    stats.over_5ms = 0
+    return nothing
+end
+
 function RecvGapStats(window_size::Int = 64)
     window_size < 1 && error("ADFMCOMMS2Src: gap window_size must be at least 1.")
     return RecvGapStats(0, 0, 0, 0, 0, 0, 0, Vector{Int64}(undef, window_size), 0, 1, 0)
@@ -201,6 +235,11 @@ function close!(context::ADFMCOMMS2Src)
     end
 
     context.running[] = false
+    # Stop device first to unblock recv! / iio_buffer_refill wait promptly.
+    try
+        ADFMCOMMS2.stop!(context.adapter)
+    catch
+    end
     if context.recv_task !== nothing
         Base.disable_sigint() do
             try
@@ -325,15 +364,25 @@ function recv_task!(context::ADFMCOMMS2Src{T}) where {T}
     catch e
         AsyncLogger.log_async("ADFMCOMMS2Src error: ", e)
     end
-    ADFMCOMMS2.stop!(context.adapter)
+    try
+        ADFMCOMMS2.stop!(context.adapter)
+    catch
+    end
 end
 
 function dispatch_task!(context::ADFMCOMMS2Src{T}, dispatch_burst::Int) where {T}
+    sink_stats = Dict{String,DispatchSinkStats}()
+    sink_stats_last_log_ns = time_ns()
     try
         while context.running[]
             if isready(context.ringbuffer.fullQ)
                 while isready(context.new_sinks)
-                    push!(context.sinks, take!(context.new_sinks))
+                    sink = take!(context.new_sinks)
+                    push!(context.sinks, sink)
+                    sink_key = string(typeof(sink))
+                    if !haskey(sink_stats, sink_key)
+                        sink_stats[sink_key] = DispatchSinkStats()
+                    end
                 end
                 # Drain available frames in a burst to reduce queue latency spikes.
                 processed = 0
@@ -341,7 +390,12 @@ function dispatch_task!(context::ADFMCOMMS2Src{T}, dispatch_burst::Int) where {T
                     idx = take!(context.ringbuffer.fullQ)
                     buf = context.ringbuffer.bufs[idx]
                     for sink in context.sinks
+                        t0_ns = time_ns()
                         input!(sink, buf.buf, buf.store_size)
+                        elapsed_ns = Int64(time_ns() - t0_ns)
+                        sink_key = string(typeof(sink))
+                        stats = get!(sink_stats, sink_key, DispatchSinkStats())
+                        update_dispatch_sink_stats!(stats, elapsed_ns)
                     end
                     buf.store_size = 0
                     put!(context.ringbuffer.freeQ, idx)
@@ -351,6 +405,34 @@ function dispatch_task!(context::ADFMCOMMS2Src{T}, dispatch_burst::Int) where {T
                         yield()
                         processed = 0
                     end
+                end
+                now_ns = time_ns()
+                if now_ns - sink_stats_last_log_ns >= 1_000_000_000
+                    worst_key = ""
+                    worst_max_ns = Int64(0)
+                    for (k, s) in sink_stats
+                        if s.max_ns > worst_max_ns
+                            worst_max_ns = s.max_ns
+                            worst_key = k
+                        end
+                    end
+                    if !isempty(worst_key)
+                        ws = sink_stats[worst_key]
+                        mean_ms = ws.calls > 0 ? (Float64(ws.total_ns) / ws.calls) / 1_000_000 : 0.0
+                        max_ms = Float64(ws.max_ns) / 1_000_000
+                        if ws.max_ns >= 1_000_000
+                            AsyncLogger.log_async("dispatch sink lag: sink=", worst_key,
+                                                  " mean_ms=", round(mean_ms, digits = 3),
+                                                  " max_ms=", round(max_ms, digits = 3),
+                                                  " over1=", ws.over_1ms,
+                                                  " over5=", ws.over_5ms,
+                                                  " calls=", ws.calls)
+                        end
+                    end
+                    for s in values(sink_stats)
+                        reset_dispatch_sink_stats!(s)
+                    end
+                    sink_stats_last_log_ns = now_ns
                 end
             else
                 yield()

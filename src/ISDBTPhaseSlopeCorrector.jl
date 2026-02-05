@@ -23,9 +23,12 @@ mutable struct ISDBTPhaseSlopeCorrectorContext <: SignalFlowBlock
     max_intercept_step::Float64
     pilot_min_mag::Float64
     pilot_trim_ratio::Float64
-    max_fit_rms::Float64
+    max_fit_rms_on::Float64
+    max_fit_rms_off::Float64
+    update_enabled::Bool
     auto_sp_phase::Bool
     symbol_index_ref::Union{Nothing,Base.Threads.Atomic{Int}}
+    gap_freeze_ref::Union{Nothing,Base.Threads.Atomic{Int}}
     slope::Float64
     intercept::Float64
     log_stats::Bool
@@ -148,8 +151,10 @@ function CreateISDBTPhaseSlopeCorrector(; nfft::Int = 8192,
                                         pilot_min_mag::Real = 0.15,
                                         pilot_trim_ratio::Real = 0.2,
                                         max_fit_rms::Real = 0.4,
+                                        max_fit_rms_off::Union{Nothing,Real} = nothing,
                                         auto_sp_phase::Bool = true,
                                         symbol_index_ref::Union{Nothing,Base.Threads.Atomic{Int}} = nothing,
+                                        gap_freeze_ref::Union{Nothing,Base.Threads.Atomic{Int}} = nothing,
                                         log_stats::Bool = false,
                                         log_interval::Real = 1.0,
                                         poolsize::Int = 8)
@@ -163,6 +168,9 @@ function CreateISDBTPhaseSlopeCorrector(; nfft::Int = 8192,
     max_fit_rms <= 0 && error("ISDBTPhaseSlopeCorrector: max_fit_rms must be > 0.")
     poolsize < 1 && error("ISDBTPhaseSlopeCorrector: poolsize must be at least 1.")
     log_interval <= 0 && error("ISDBTPhaseSlopeCorrector: log_interval must be > 0.")
+    fit_rms_on = Float64(max_fit_rms)
+    fit_rms_off = max_fit_rms_off === nothing ? fit_rms_on * 1.25 : Float64(max_fit_rms_off)
+    (0.0 < fit_rms_on <= fit_rms_off) || error("ISDBTPhaseSlopeCorrector: require 0 < max_fit_rms <= max_fit_rms_off.")
 
     pos = segment_carriers > 0 ?
           seg0_pilot_bins(nfft, pilot_spacing, pilot_offset0, segment_carriers) :
@@ -200,9 +208,12 @@ function CreateISDBTPhaseSlopeCorrector(; nfft::Int = 8192,
                                           Float64(max_intercept_step_deg) * Float64(pi) / 180.0,
                                           Float64(pilot_min_mag),
                                           Float64(pilot_trim_ratio),
-                                          Float64(max_fit_rms),
+                                          fit_rms_on,
+                                          fit_rms_off,
+                                          false,
                                           auto_sp_phase,
                                           symbol_index_ref,
+                                          gap_freeze_ref,
                                           0.0,
                                           0.0,
                                           log_stats,
@@ -363,7 +374,18 @@ function task!(context::ISDBTPhaseSlopeCorrectorContext)
                         end
                         fit_rms = cnt_fit > 0 ? sqrt(fit_rms / cnt_fit) : 0.0
 
-                        if fit_rms <= context.max_fit_rms
+                        freeze_active = context.gap_freeze_ref !== nothing && context.gap_freeze_ref[] > 0
+                        if freeze_active
+                            context.update_enabled = false
+                        elseif context.update_enabled
+                            if fit_rms > context.max_fit_rms_off
+                                context.update_enabled = false
+                            end
+                        elseif fit_rms <= context.max_fit_rms_on
+                            context.update_enabled = true
+                        end
+
+                        if context.update_enabled && !freeze_active
                             slope_delta = context.alpha * (slope - context.slope)
                             if slope_delta > context.max_slope_step
                                 slope_delta = context.max_slope_step
@@ -406,6 +428,7 @@ function task!(context::ISDBTPhaseSlopeCorrectorContext)
                                         " rms=", round(rms, digits = 3),
                                         " fit_rms=", round(fit_rms, digits = 3),
                                         " used=", used, "/", n,
+                                        " gate=", context.update_enabled,
                                         " updated=", update_applied)
                             end
                             context.last_log_time = now
