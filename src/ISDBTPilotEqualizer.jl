@@ -4,6 +4,7 @@ import ..SignalFlowBlock
 import ..input!
 import ..RingBuffers: RingFrameBuffer
 import ..ISDBTPRBS
+import ..SeqTrace
 
 mutable struct ISDBTPilotEqualizerContext <: SignalFlowBlock
     running::Base.Threads.Atomic{Bool}
@@ -20,6 +21,9 @@ mutable struct ISDBTPilotEqualizerContext <: SignalFlowBlock
     prbs_bits::Vector{Int}
     auto_sp_phase::Bool
     symbol_index_ref::Union{Nothing,Base.Threads.Atomic{Int}}
+    temporal_alpha::Float32
+    h_prev::Vector{ComplexF32}
+    h_prev_valid::Vector{Bool}
     h_est::Vector{ComplexF32}
     outbuf::Vector{ComplexF32}
     log_stats::Bool
@@ -120,6 +124,7 @@ function CreateISDBTPilotEqualizer(; nfft::Int = 8192,
                                    segment_index::Int = 0,
                                    auto_sp_phase::Bool = true,
                                    symbol_index_ref::Union{Nothing,Base.Threads.Atomic{Int}} = nothing,
+                                   temporal_alpha::Real = 0.2,
                                    log_stats::Bool = false,
                                    log_interval::Real = 1.0,
                                    poolsize::Int = 8)
@@ -130,6 +135,8 @@ function CreateISDBTPilotEqualizer(; nfft::Int = 8192,
     band_limit_hz < 0 && error("ISDBTPilotEqualizer: band_limit_hz must be >= 0.")
     segment_carriers < 1 && error("ISDBTPilotEqualizer: segment_carriers must be >= 1.")
     log_interval <= 0 && error("ISDBTPilotEqualizer: log_interval must be > 0.")
+    (temporal_alpha < 0 || temporal_alpha > 1) &&
+        error("ISDBTPilotEqualizer: temporal_alpha must be in [0, 1].")
 
     pos = segment_carriers > 0 ?
           seg0_pilot_bins(nfft, pilot_spacing, pilot_offset0, segment_carriers) :
@@ -138,7 +145,7 @@ function CreateISDBTPilotEqualizer(; nfft::Int = 8192,
     length(pilot_values) != length(pos) && error("ISDBTPilotEqualizer: pilot_values length mismatch.")
     prbs_bits = band_limit_hz > 0 ? ISDBTPRBS.mode3_segment_prbs(segment_index; carriers = segment_carriers) : Int[]
 
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     ctx = ISDBTPilotEqualizerContext(Base.Threads.Atomic{Bool}(true),
                                      nfft,
@@ -154,6 +161,9 @@ function CreateISDBTPilotEqualizer(; nfft::Int = 8192,
                                      prbs_bits,
                                      auto_sp_phase,
                                      symbol_index_ref,
+                                     Float32(temporal_alpha),
+                                     fill(ComplexF32(1, 0), nfft),
+                                     fill(false, nfft),
                                      Vector{ComplexF32}(undef, nfft),
                                      Vector{ComplexF32}(undef, nfft),
                                      log_stats,
@@ -175,6 +185,11 @@ function task!(context::ISDBTPilotEqualizerContext)
                 rd_index = take!(context.ringbuffer.fullQ)
                 rd_buffer = context.ringbuffer.bufs[rd_index]
                 if rd_buffer.store_size == context.nfft
+                    in_seq = UInt64(0)
+                    if SeqTrace.is_enabled()
+                        in_seq = SeqTrace.get_seq(rd_buffer.buf)
+                        SeqTrace.log_in!("PilotEQ", context, in_seq)
+                    end
                     fill!(context.h_est, ComplexF32(1, 0))
                     if context.symbol_index_ref !== nothing
                         context.symbol_index = context.symbol_index_ref[]
@@ -230,7 +245,30 @@ function task!(context::ISDBTPilotEqualizerContext)
                     end
                     @inbounds for i in 1:length(use_pos)
                         idx = use_pos[i]
-                        context.h_est[idx] = rd_buffer.buf[idx] / use_vals[i]
+                        h_raw = rd_buffer.buf[idx] / use_vals[i]
+                        if context.temporal_alpha > 0f0 && context.h_prev_valid[idx]
+                            a = context.temporal_alpha
+                            prev = context.h_prev[idx]
+                            prev_mag = sqrt(real(prev) * real(prev) + imag(prev) * imag(prev))
+                            raw_mag = sqrt(real(h_raw) * real(h_raw) + imag(h_raw) * imag(h_raw))
+                            mag_sm = prev_mag + (raw_mag - prev_mag) * a
+                            h_sm = if raw_mag > 0f0
+                                # Keep instantaneous phase (avoid phase-cancellation by temporal averaging).
+                                ComplexF32(real(h_raw) * (mag_sm / raw_mag),
+                                          imag(h_raw) * (mag_sm / raw_mag))
+                            elseif prev_mag > 0f0
+                                ComplexF32(real(prev) * (mag_sm / prev_mag),
+                                          imag(prev) * (mag_sm / prev_mag))
+                            else
+                                ComplexF32(mag_sm, 0f0)
+                            end
+                            context.h_prev[idx] = h_sm
+                            context.h_est[idx] = h_sm
+                        else
+                            context.h_prev[idx] = h_raw
+                            context.h_prev_valid[idx] = true
+                            context.h_est[idx] = h_raw
+                        end
                     end
                     if length(use_pos) >= 2
                         if context.band_limit_hz > 0 && context.segment_carriers > 0
@@ -290,6 +328,10 @@ function task!(context::ISDBTPilotEqualizerContext)
                     end
                     context.symbol_index += 1
 
+                    if SeqTrace.is_enabled() && in_seq != 0
+                        SeqTrace.set_seq!(context.outbuf, in_seq)
+                        SeqTrace.log_out!("PilotEQ", context, in_seq)
+                    end
                     while isready(context.new_sinks)
                         push!(context.sinks, take!(context.new_sinks))
                     end
@@ -329,6 +371,9 @@ function input!(context::ISDBTPilotEqualizerContext, samples::AbstractVector{Com
         idx = take!(context.ringbuffer.freeQ)
         buf = context.ringbuffer.bufs[idx]
         copyto!(buf.buf, 1, samples, 1, actual_size)
+        if SeqTrace.is_enabled()
+            SeqTrace.inherit_seq!(samples, buf.buf)
+        end
         buf.store_size = actual_size
         put!(context.ringbuffer.fullQ, idx)
     else

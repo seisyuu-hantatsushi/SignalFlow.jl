@@ -1,10 +1,12 @@
 import SignalFlow
 import SignalFlow.ADFMCOMMS2Src
 import SignalFlow.BandSNREstimator
+import SignalFlow.AWGNInjector
 import SignalFlow.ConstellationView
 import SignalFlow.BinPowerMonitor
 import SignalFlow.PilotCorrelationMonitor
 import SignalFlow.SignalStatsMonitor
+import SignalFlow.ISDBTEVMMonitor
 import SignalFlow.FFTBlock
 import SignalFlow.FFTView
 import SignalFlow.GainBlock
@@ -32,6 +34,7 @@ const ExpectedFrameMs = 1000 * FrameSymbols * (OFDM_NFFT + OFDM_NCP) / ADC_Sampl
 const BlockPool = 64
 const PhasePool = 128
 const SyncFrameSize = 131072
+const StatsMonitorPool = 32
 
 function parse_si_hz(s::String)
     m = match(r"^([+-]?[0-9]*\.?[0-9]+)([kKmMgGtTpP]?)$", s)
@@ -76,6 +79,7 @@ function parse_args(args)
     pilot_offset0 = 1
     seg0_flip = false
     pilot_eq_only = false
+    pilot_temporal_alpha = 0.2
     tmcc_dbpsk = false
     tmcc_sync_word = nothing
     extractor_free_run = false
@@ -86,6 +90,16 @@ function parse_args(args)
     src_drop_backpressure = true
     const_update_interval = 0
     const_drop_log_interval = 0
+    seq_trace = false
+    seq_trace_log_interval = 200
+    seq_trace_stage = nothing
+    evm = false
+    evm_mod = "qpsk"
+    evm_log_interval = 10.0
+    awgn_snr_db = nothing
+    awgn_log_interval = 10.0
+    framesync_unlock_threshold = 0.25
+    framesync_unlock_confirm = 20
     i = 1
     while i <= length(args)
         a = args[i]
@@ -121,6 +135,10 @@ function parse_args(args)
             seg0_flip = true
         elseif a == "--pilot-eq-only"
             pilot_eq_only = true
+        elseif a == "--pilot-temporal-alpha"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            pilot_temporal_alpha = parse(Float64, args[i])
         elseif a == "--tmcc-dbpsk"
             tmcc_dbpsk = true
         elseif a == "--tmcc-sync-word"
@@ -151,6 +169,42 @@ function parse_args(args)
             i += 1
             i > length(args) && error("Missing value for $a")
             const_drop_log_interval = parse(Int, args[i])
+        elseif a == "--seq-trace"
+            seq_trace = true
+        elseif a == "--seq-trace-log-interval"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            seq_trace_log_interval = parse(Int, args[i])
+        elseif a == "--seq-trace-stage"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            seq_trace_stage = args[i]
+        elseif a == "--evm"
+            evm = true
+        elseif a == "--evm-mod"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            evm_mod = lowercase(args[i])
+        elseif a == "--evm-log-interval"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            evm_log_interval = parse(Float64, args[i])
+        elseif a == "--awgn-snr-db"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            awgn_snr_db = parse(Float64, args[i])
+        elseif a == "--awgn-log-interval"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            awgn_log_interval = parse(Float64, args[i])
+        elseif a == "--framesync-unlock-threshold"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            framesync_unlock_threshold = parse(Float64, args[i])
+        elseif a == "--framesync-unlock-confirm"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            framesync_unlock_confirm = parse(Int, args[i])
         else
             error("Unknown argument: $a")
         end
@@ -161,46 +215,21 @@ function parse_args(args)
     src_dispatch_burst < 1 && error("--src-dispatch-burst must be >= 1")
     const_update_interval < 0 && error("--const-update-interval must be >= 0")
     const_drop_log_interval < 0 && error("--const-drop-log-interval must be >= 0")
-    return carrier, uri, diag, show_const, show_fft, show_wave, show_sync, show_pilots, fft_gain, pilot_offset0, seg0_flip, pilot_eq_only, tmcc_dbpsk, tmcc_sync_word, extractor_free_run, no_cpe, no_slope, src_poolsize, src_dispatch_burst, src_drop_backpressure, const_update_interval, const_drop_log_interval
+    seq_trace_log_interval < 1 && error("--seq-trace-log-interval must be >= 1")
+    evm_log_interval <= 0 && error("--evm-log-interval must be > 0")
+    awgn_log_interval <= 0 && error("--awgn-log-interval must be > 0")
+    framesync_unlock_threshold <= 0 && error("--framesync-unlock-threshold must be > 0")
+    framesync_unlock_confirm < 1 && error("--framesync-unlock-confirm must be >= 1")
+    !(evm_mod in ("qpsk", "16qam", "64qam")) &&
+        error("--evm-mod must be one of qpsk/16qam/64qam")
+    awgn_snr_db !== nothing && !isfinite(awgn_snr_db) &&
+        error("--awgn-snr-db must be finite")
+    (pilot_temporal_alpha < 0 || pilot_temporal_alpha > 1) &&
+        error("--pilot-temporal-alpha must be in [0, 1]")
+    return carrier, uri, diag, show_const, show_fft, show_wave, show_sync, show_pilots, fft_gain, pilot_offset0, seg0_flip, pilot_eq_only, pilot_temporal_alpha, tmcc_dbpsk, tmcc_sync_word, extractor_free_run, no_cpe, no_slope, src_poolsize, src_dispatch_burst, src_drop_backpressure, const_update_interval, const_drop_log_interval, seq_trace, seq_trace_log_interval, seq_trace_stage, evm, evm_mod, evm_log_interval, awgn_snr_db, awgn_log_interval, framesync_unlock_threshold, framesync_unlock_confirm
 end
 
 using ADFMCOMMS2
-
-function stop_block!(blk)
-    blk === nothing && return
-    # Phase-1: signal stop without blocking.
-    if hasproperty(blk, :running)
-        try
-            blk.running[] = false
-        catch
-        end
-    end
-    mod = parentmodule(typeof(blk))
-    stop_task = Threads.@spawn begin
-        try
-            if isdefined(mod, :stop!)
-                f = getfield(mod, :stop!)
-                if applicable(f, blk)
-                    f(blk)
-                    return
-                end
-            end
-            if isdefined(mod, :close!)
-                f = getfield(mod, :close!)
-                if applicable(f, blk)
-                    f(blk)
-                    return
-                end
-            end
-        catch e
-            println("shutdown warning (", mod, "): ", e)
-        end
-    end
-    status = timedwait(() -> istaskdone(stop_task), 0.5)
-    if status == :timed_out
-        println("shutdown timeout (", mod, ")")
-    end
-end
 
 function connect_blocks!(src, sink)
     src === nothing && return
@@ -209,64 +238,22 @@ function connect_blocks!(src, sink)
     return
 end
 
-function stop_tracked_blocks!()
-    nodes, edges = SignalFlow.flow_graph_snapshot()
-    indeg = IdDict{Any,Int}()
-    for node in nodes
-        indeg[node] = 0
-    end
-    for (_, dsts) in edges
-        for dst in dsts
-            indeg[dst] = get(indeg, dst, 0) + 1
-        end
-    end
-    queue = Any[node for node in nodes if get(indeg, node, 0) == 0]
-    order = Any[]
-    while !isempty(queue)
-        node = popfirst!(queue)
-        push!(order, node)
-        for dst in get(edges, node, Any[])
-            d = get(indeg, dst, 0) - 1
-            indeg[dst] = d
-            if d == 0
-                push!(queue, dst)
-            end
-        end
-    end
-    if length(order) != length(nodes)
-        # Fallback when graph is incomplete/cyclic; preserve deterministic shutdown.
-        order = copy(nodes)
-    end
-    # Phase-1: broadcast running=false to every block first.
-    for blk in nodes
-        if hasproperty(blk, :running)
-            try
-                blk.running[] = false
-            catch
-            end
-        end
-    end
-    # Phase-2: downstream -> upstream stop/close with timeout.
-    for blk in reverse(order)
-        try
-            stop_block!(blk)
-        catch e
-            if !(e isa InterruptException)
-                println("shutdown warning: ", e)
-            end
-        end
-    end
-    return
-end
-
 function main()
     prev_exit_on_sigint = Base.exit_on_sigint(false)
     restore_exit_on_sigint = prev_exit_on_sigint isa Bool
-    carrier, uri, diag, show_const, show_fft, show_wave, show_sync, show_pilots, fft_gain, pilot_offset0, seg0_flip, pilot_eq_only, tmcc_dbpsk, tmcc_sync_word, extractor_free_run, no_cpe, no_slope, src_poolsize, src_dispatch_burst, src_drop_backpressure, const_update_interval, const_drop_log_interval = parse_args(ARGS)
+    carrier, uri, diag, show_const, show_fft, show_wave, show_sync, show_pilots, fft_gain, pilot_offset0, seg0_flip, pilot_eq_only, pilot_temporal_alpha, tmcc_dbpsk, tmcc_sync_word, extractor_free_run, no_cpe, no_slope, src_poolsize, src_dispatch_burst, src_drop_backpressure, const_update_interval, const_drop_log_interval, seq_trace, seq_trace_log_interval, seq_trace_stage, evm, evm_mod, evm_log_interval, awgn_snr_db, awgn_log_interval, framesync_unlock_threshold, framesync_unlock_confirm = parse_args(ARGS)
+    # Miss-only logging to avoid adding load from OK logs.
+    SignalFlow.SeqTrace.configure!(enabled = seq_trace,
+                                   log_interval = seq_trace_log_interval,
+                                   log_ok = false,
+                                   stage_filter = seq_trace_stage)
+    seq_trace && println("SeqTrace enabled: log_interval=", seq_trace_log_interval,
+                         " log_ok=false",
+                         " stage=", seq_trace_stage === nothing ? "all" : seq_trace_stage)
     # Keep diagnostic logging lightweight for remote/headless runs.
-    diag_log_interval = diag ? 15.0 : 1.0
-    diag_tmcc_log_interval = diag ? 15.0 : 1.0
-    diag_tmcc_dbpsk_log_interval = diag ? 10.0 : 0.5
+    diag_log_interval = diag ? 30.0 : 1.0
+    diag_tmcc_log_interval = diag ? 30.0 : 1.0
+    diag_tmcc_dbpsk_log_interval = diag ? 20.0 : 0.5
     diag_view_update_interval = diag ? 60 : 5
     const_update_interval = const_update_interval > 0 ? const_update_interval : diag_view_update_interval
     const_drop_log_interval = const_drop_log_interval > 0 ? const_drop_log_interval : (diag ? 2000 : 500)
@@ -277,6 +264,12 @@ function main()
     enable_rate_monitors = !diag
     SignalFlow.ISDBTPRBS.set_seg0_flip!(seg0_flip)
     println("ISDBTPRBS seg0 mapping flip: ", seg0_flip)
+    println("PilotEQ temporal_alpha: ", round(pilot_temporal_alpha, digits = 3))
+    evm && println("EVM monitor: mod=", evm_mod, " interval=", round(evm_log_interval, digits = 2), "s")
+    awgn_snr_db !== nothing && println("AWGNInjector enabled: snr_db=", round(awgn_snr_db, digits = 2),
+                                       " log_interval=", round(awgn_log_interval, digits = 2), "s")
+    println("FrameSync unlock_threshold: ", round(framesync_unlock_threshold, digits = 3),
+            " unlock_confirm: ", framesync_unlock_confirm)
     println("OFDM params: nfft=", OFDM_NFFT, " cp=", OFDM_NCP,
             " frame_ms_expected=", round(ExpectedFrameMs, digits = 3))
     if pilot_eq_only
@@ -300,6 +293,16 @@ function main()
                                dispatch_burst = src_dispatch_burst,
                                drop_on_backpressure = src_drop_backpressure,
                                backpressure_log_interval = diag ? 800 : 200)
+    src_frame_size = length(rfsrc.ringbuffer.bufs[1].buf)
+    if awgn_snr_db !== nothing
+        awgn = AWGNInjector.CreateAWGNInjector(ComplexF32; snr_db = awgn_snr_db,
+                                               frame_size = src_frame_size,
+                                               log_stats = true,
+                                               log_interval = awgn_log_interval,
+                                               poolsize = BlockPool)
+    else
+        awgn = nothing
+    end
 
     sync = ISDBTSymbolSync.CreateISDBTSymbolSync(; mode = 3,
                                                  gi = GI_Ratio,
@@ -351,14 +354,14 @@ function main()
     exclude_bins = [SignalFlow.ISDBTPRBS.seg0_carrier_to_bin(OFDM_NFFT, k, SegmentCarriers) for k in exclude_seg0]
     frame_sync_core = ISDBTFrameSync.ISDBTFrameSyncCoreConfig(OFDM_NFFT, FrameSymbols, tmcc_bins, BlockPool)
     frame_sync_lock = ISDBTFrameSync.ISDBTFrameSyncLockConfig(lock_threshold = 0.65,
-                                                              unlock_threshold = 0.2,
+                                                              unlock_threshold = framesync_unlock_threshold,
                                                               lock_confirm = 2,
-                                                              unlock_confirm = 20)
+                                                              unlock_confirm = framesync_unlock_confirm)
     frame_sync_cycle = ISDBTFrameSync.ISDBTFrameSyncCycleConfig(expected_frame_ms = ExpectedFrameMs,
                                                                 cycle_outlier_ratio = 0.15)
-    frame_sync_log = ISDBTFrameSync.ISDBTFrameSyncLogConfig(log_interval = 200,
-                                                            cycle_log_interval = diag ? 80 : 20,
-                                                            input_gap_log_interval_sec = diag ? 3.0 : 1.0)
+    frame_sync_log = ISDBTFrameSync.ISDBTFrameSyncLogConfig(log_interval = diag ? 1200 : 200,
+                                                            cycle_log_interval = diag ? 240 : 20,
+                                                            input_gap_log_interval_sec = diag ? 10.0 : 1.0)
     frame_sync = ISDBTFrameSync.CreateISDBTFrameSync(frame_sync_core;
                                                      lock = frame_sync_lock,
                                                      cycle = frame_sync_cycle,
@@ -419,6 +422,7 @@ function main()
                                                              segment_index = 0,
                                                              auto_sp_phase = false,
                                                              symbol_index_ref = frame_sync.symbol_index_ref,
+                                                             temporal_alpha = pilot_temporal_alpha,
                                                              log_stats = diag,
                                                              log_interval = diag_log_interval,
                                                              poolsize = BlockPool)
@@ -438,7 +442,15 @@ function main()
                                                                         max_intercept_step_deg = 10.0,
                                                                         pilot_min_mag = 0.2,
                                                                         pilot_trim_ratio = 0.15,
-                                                                        max_fit_rms = 0.35,
+                                                                        # Wider hysteresis + longer confirms to avoid gate chatter.
+                                                                        max_fit_rms = 0.30,
+                                                                        max_fit_rms_off = 0.45,
+                                                                        min_used_pilots = 24,
+                                                                        min_used_ratio = 0.65,
+                                                                        update_confirm = 3,
+                                                                        update_fail_confirm = 3,
+                                                                        min_slope_step = 7.5e-5,
+                                                                        min_intercept_step_deg = 0.4,
                                                                         auto_sp_phase = false,
                                                                         symbol_index_ref = frame_sync.symbol_index_ref,
                                                                         gap_freeze_ref = frame_sync.gap_freeze_ref,
@@ -461,7 +473,13 @@ function main()
                                                         cpe_max_step_deg = 10.0,
                                                         pilot_min_mag = 0.2,
                                                         pilot_trim_ratio = 0.15,
-                                                        min_update_conf = 0.25,
+                                                        # Keep gate stable under transient confidence dips.
+                                                        min_update_conf = 0.30,
+                                                        min_update_conf_off = 0.20,
+                                                        conf_gain_floor = 0.05,
+                                                        update_confirm = 3,
+                                                        update_fail_confirm = 3,
+                                                        min_phase_step_deg = 0.4,
                                                         auto_sp_phase = false,
                                                         symbol_index_ref = frame_sync.symbol_index_ref,
                                                         gap_freeze_ref = frame_sync.gap_freeze_ref,
@@ -551,16 +569,22 @@ function main()
     SignalFlow.reset_flow_graph!()
 
     connect_blocks!(rfsrc, snr)
+    sync_src = rfsrc
+    if awgn !== nothing
+        connect_blocks!(rfsrc, awgn)
+        sync_src = awgn
+    end
     if mon_sync !== nothing
-        connect_blocks!(rfsrc, mon_sync)
+        connect_blocks!(sync_src, mon_sync)
         connect_blocks!(mon_sync, sync)
     else
-        connect_blocks!(rfsrc, sync)
+        connect_blocks!(sync_src, sync)
     end
     if diag
         stats_sync = SignalStatsMonitor.CreateSignalStatsMonitor(; frame_size = OFDM_NFFT,
                                                                  label = "SymbolSync out",
-                                                                 log_interval = diag_log_interval)
+                                                                 log_interval = diag_log_interval,
+                                                                 poolsize = StatsMonitorPool)
     else
         stats_sync = nothing
     end
@@ -588,7 +612,8 @@ function main()
     if diag
         stats_fft = SignalStatsMonitor.CreateSignalStatsMonitor(; frame_size = OFDM_NFFT,
                                                                 label = "FFT out",
-                                                                log_interval = diag_log_interval)
+                                                                log_interval = diag_log_interval,
+                                                                poolsize = StatsMonitorPool)
         connect_blocks!(fft_gain_block, stats_fft)
     end
     if fft_view !== nothing
@@ -603,7 +628,8 @@ function main()
     if diag
         stats_piloteq = SignalStatsMonitor.CreateSignalStatsMonitor(; frame_size = OFDM_NFFT,
                                                                     label = "PilotEQ out",
-                                                                    log_interval = diag_log_interval)
+                                                                    log_interval = diag_log_interval,
+                                                                    poolsize = StatsMonitorPool)
         connect_blocks!(pilot_eq, stats_piloteq)
         pilot_corr_eq = PilotCorrelationMonitor.CreatePilotCorrelationMonitor(; nfft = OFDM_NFFT,
                                                                               pilot_spacing = 12,
@@ -621,7 +647,8 @@ function main()
         if diag
             stats_slope = SignalStatsMonitor.CreateSignalStatsMonitor(; frame_size = OFDM_NFFT,
                                                                       label = "PhaseSlope out",
-                                                                      log_interval = diag_log_interval)
+                                                                      log_interval = diag_log_interval,
+                                                                      poolsize = StatsMonitorPool)
             connect_blocks!(slope, stats_slope)
         end
         prev_block = slope
@@ -631,7 +658,8 @@ function main()
         if diag
             stats_cpe = SignalStatsMonitor.CreateSignalStatsMonitor(; frame_size = OFDM_NFFT,
                                                                     label = "CPE out",
-                                                                    log_interval = diag_log_interval)
+                                                                    log_interval = diag_log_interval,
+                                                                    poolsize = StatsMonitorPool)
             connect_blocks!(cpe, stats_cpe)
         end
         prev_block = cpe
@@ -647,8 +675,17 @@ function main()
     if diag
         stats_data = SignalStatsMonitor.CreateSignalStatsMonitor(; frame_size = length(data_carriers.outbuf),
                                                                  label = "DataCarriers out",
-                                                                 log_interval = diag_log_interval)
+                                                                 log_interval = diag_log_interval,
+                                                                 poolsize = StatsMonitorPool)
         connect_blocks!(data_carriers, stats_data)
+    end
+    if evm
+        evm_mon = ISDBTEVMMonitor.CreateISDBTEVMMonitor(; frame_size = length(data_carriers.outbuf),
+                                                        modulation = evm_mod,
+                                                        label = "DataCarriers",
+                                                        log_interval = evm_log_interval,
+                                                        poolsize = StatsMonitorPool)
+        connect_blocks!(data_carriers, evm_mon)
     end
     if constellation !== nothing
         connect_blocks!(data_carriers, constellation)
@@ -676,7 +713,7 @@ function main()
         # Keep shutdown deterministic even when INT arrives during cleanup.
         shutdown_once = function ()
             try
-                stop_tracked_blocks!()
+                SignalFlow.stop_flow_graph!(timeout_sec = 0.5, clear_graph = true)
             catch e
                 if !(e isa InterruptException)
                     println("shutdown warning: ", e)
@@ -690,16 +727,26 @@ function main()
                 end
             end
         end
-        try
-            Base.disable_sigint() do
-                shutdown_once()
+
+        # INT can race with cleanup; retry with SIGINT disabled first, then best effort.
+        shutdown_done = false
+        for _ in 1:2
+            try
+                Base.disable_sigint() do
+                    shutdown_once()
+                end
+                shutdown_done = true
+                break
+            catch e
+                if !(e isa InterruptException)
+                    rethrow()
+                end
             end
-        catch e
-            if e isa InterruptException
-                # If INT hits around disable_sigint boundary, do best-effort shutdown once more.
+        end
+        if !shutdown_done
+            try
                 shutdown_once()
-            else
-                rethrow()
+            catch
             end
         end
         if restore_exit_on_sigint

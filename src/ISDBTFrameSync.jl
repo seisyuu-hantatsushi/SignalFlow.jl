@@ -4,6 +4,7 @@ import ..SignalFlowBlock
 import ..input!
 import ..RingBuffers: RingFrameBuffer
 import ..AsyncLogger
+import ..SeqTrace
 
 struct ISDBTFrameSyncCoreConfig
     nfft::Int
@@ -99,6 +100,42 @@ mutable struct ISDBTFrameSyncRuntime
     input_gap_count::Int
     input_gap_event_streak::Int
     input_gap_last_event_ns::Int64
+    seq_anomaly_count::Int
+    unlock_suppressed_count::Int
+    last_enq_seq::UInt64
+    last_deq_seq::UInt64
+end
+
+const SEQ_TRACE_JUMP_WARN = Int64(64)
+
+@inline function maybe_log_seq_jump!(context,
+                                     where_tag::AbstractString,
+                                     idx::Int,
+                                     prev_seq::UInt64,
+                                     cur_seq::UInt64)
+    if !SeqTrace.is_enabled() || !SeqTrace.stage_allowed("ISDBTFrameSync")
+        return nothing
+    end
+    if prev_seq == 0 || cur_seq == 0
+        return nothing
+    end
+    delta = Int64(cur_seq) - Int64(prev_seq)
+    if abs(delta) > SEQ_TRACE_JUMP_WARN
+        context.state.seq_anomaly_count += 1
+        AsyncLogger.log_async("ISDBTFrameSync: seq_probe where=",
+                              where_tag,
+                              " idx=",
+                              idx,
+                              " prev=",
+                              Int64(prev_seq),
+                              " cur=",
+                              Int64(cur_seq),
+                              " delta=",
+                              delta,
+                              " anomalies=",
+                              context.state.seq_anomaly_count)
+    end
+    return nothing
 end
 
 mutable struct ISDBTFrameSyncContext <: SignalFlowBlock
@@ -203,7 +240,7 @@ function CreateISDBTFrameSync(; nfft::Int = 8192,
     poolsize < 1 && error("ISDBTFrameSync: poolsize must be at least 1.")
 
     tmcc_ring = [Vector{ComplexF32}(undef, length(tmcc_bins)) for _ in 1:frame_symbols]
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     params = ISDBTFrameSyncParams(Float64(lock_threshold),
                                   Float64(unlock_threshold),
@@ -252,7 +289,11 @@ function CreateISDBTFrameSync(; nfft::Int = 8192,
                                   0,
                                   0,
                                   0,
-                                  0)
+                                  0,
+                                  0,
+                                  0,
+                                  UInt64(0),
+                                  UInt64(0))
     ctx = ISDBTFrameSyncContext(Base.Threads.Atomic{Bool}(true),
                                 nfft,
                                 frame_symbols,
@@ -281,6 +322,15 @@ function task!(context::ISDBTFrameSyncContext)
                 rd_index = take!(context.ringbuffer.fullQ)
                 rd_buffer = context.ringbuffer.bufs[rd_index]
                 if rd_buffer.store_size == context.nfft
+                    in_seq = UInt64(0)
+                    if SeqTrace.is_enabled()
+                        in_seq = SeqTrace.get_seq(rd_buffer.buf)
+                        maybe_log_seq_jump!(context, "dequeue", rd_index, context.state.last_deq_seq, in_seq)
+                        if in_seq != 0
+                            context.state.last_deq_seq = in_seq
+                        end
+                        SeqTrace.log_in!("ISDBTFrameSync", context, in_seq)
+                    end
                     context.state.total_symbols += 1
                     skip_ref_update = false
                     idx = (context.state.symbol_index % context.frame_symbols) + 1
@@ -322,17 +372,28 @@ function task!(context::ISDBTFrameSyncContext)
                             context.logs.log_count = 0
                             AsyncLogger.log_async("ISDBTFrameSync: corr=", corr,
                                     " ema=", round(metric, digits = 4),
-                                    " locked=", context.state.locked)
+                                    " locked=", context.state.locked,
+                                    " unlock_suppressed=", context.state.unlock_suppressed_count)
                         end
                         if !freeze_active
+                            # While reference update is intentionally held (warmup/outlier recovery),
+                            # suppress unlock progression to avoid lock chatter on transient metric dips.
+                            unlock_guard_active = context.state.ref_update_hold ||
+                                                  context.state.warmup_cycles_left > 0 ||
+                                                  context.state.outlier_streak > 0
                             if metric >= context.params.lock_threshold + context.params.metric_guard_band
                                 context.state.lock_count += 1
                                 context.state.unlock_count = 0
                             elseif metric <= context.params.unlock_threshold - context.params.metric_guard_band
                                 context.state.lock_count = 0
-                                if context.state.locked && context.state.lock_age >= context.params.min_lock_symbols
+                                if context.state.locked &&
+                                   context.state.lock_age >= context.params.min_lock_symbols &&
+                                   !unlock_guard_active
                                     context.state.unlock_count += 1
                                 else
+                                    if unlock_guard_active && context.state.locked
+                                        context.state.unlock_suppressed_count += 1
+                                    end
                                     context.state.unlock_count = 0
                                 end
                             else
@@ -463,6 +524,11 @@ function task!(context::ISDBTFrameSyncContext)
                                 context.state.good_cycle_streak = 0
                                 context.state.ref_update_hold = true
                                 skip_ref_update = true
+                                if context.params.gap_freeze_symbols > 0
+                                    context.state.gap_freeze_countdown =
+                                        max(context.state.gap_freeze_countdown, context.params.gap_freeze_symbols)
+                                    context.gap_freeze_ref[] = context.state.gap_freeze_countdown
+                                end
                                 AsyncLogger.log_async("ISDBTFrameSync: frame_cycle_outlier_ms=",
                                         round(dt_ms_stream, digits = 3),
                                         " wall_ms=",
@@ -491,6 +557,11 @@ function task!(context::ISDBTFrameSyncContext)
                                     context.state.warmup_cycles_left = context.params.warmup_cycle_count
                                     context.state.good_cycle_streak = 0
                                     context.state.ref_update_hold = true
+                                    if context.params.gap_freeze_symbols > 0
+                                        context.state.gap_freeze_countdown =
+                                            max(context.state.gap_freeze_countdown, context.params.gap_freeze_symbols)
+                                        context.gap_freeze_ref[] = context.state.gap_freeze_countdown
+                                    end
                                     AsyncLogger.log_async("ISDBTFrameSync: forced_resync count=",
                                             context.state.forced_resync_count,
                                             " reason=cycle_outlier")
@@ -508,6 +579,10 @@ function task!(context::ISDBTFrameSyncContext)
                     end
 
                     copyto!(context.outbuf, 1, rd_buffer.buf, 1, context.nfft)
+                    if SeqTrace.is_enabled() && in_seq != 0
+                        SeqTrace.set_seq!(context.outbuf, in_seq)
+                        SeqTrace.log_out!("ISDBTFrameSync", context, in_seq)
+                    end
                     while isready(context.new_sinks)
                         push!(context.sinks, take!(context.new_sinks))
                     end
@@ -559,6 +634,14 @@ function input!(context::ISDBTFrameSyncContext, samples::AbstractVector{ComplexF
     idx = take!(context.ringbuffer.freeQ)
     buf = context.ringbuffer.bufs[idx]
     copyto!(buf.buf, 1, samples, 1, actual_size)
+    if SeqTrace.is_enabled()
+        SeqTrace.inherit_seq!(samples, buf.buf)
+        enq_seq = SeqTrace.get_seq(buf.buf)
+        maybe_log_seq_jump!(context, "enqueue", idx, context.state.last_enq_seq, enq_seq)
+        if enq_seq != 0
+            context.state.last_enq_seq = enq_seq
+        end
+    end
     buf.store_size = actual_size
     put!(context.ringbuffer.fullQ, idx)
     if context.params.expected_symbol_ms > 0
@@ -578,28 +661,14 @@ function input!(context::ISDBTFrameSyncContext, samples::AbstractVector{ComplexF
                 end
                 context.state.input_gap_last_event_ns = now_ns
 
-                # Guard isolated scheduler hiccups: freeze only on repeated bursts or clearly huge gaps.
+                # Monitoring only: control is stream-time based (cycle/outlier path in task!).
+                # Keep these wall-time classifications for diagnostics.
                 huge_gap = gap_ms >= (2.0 * gap_thresh_ms)
-                apply_freeze = huge_gap || (context.state.input_gap_event_streak >= 2)
-                freeze_set = 0
-                    if apply_freeze
-                    # Gap-aware freeze extension: longer upstream stalls get longer hold.
-                    # This keeps reference updates from being contaminated right after bursts.
-                    burst_freeze = 0
-                    if context.params.expected_symbol_ms > 0
-                        burst_freeze = ceil(Int, gap_ms / context.params.expected_symbol_ms)
-                    end
-                    freeze_set = max(context.params.gap_freeze_symbols, burst_freeze)
-                    freeze_set = min(freeze_set, context.frame_symbols)
-                        if freeze_set > 0
-                            context.state.gap_freeze_countdown = max(context.state.gap_freeze_countdown, freeze_set)
-                            context.gap_freeze_ref[] = context.state.gap_freeze_countdown
-                        end
-                    end
+                hard_single_gap = gap_ms >= max(60.0, 1.33 * gap_thresh_ms)
+                monitor_burst = huge_gap || hard_single_gap || (context.state.input_gap_event_streak >= 2)
                 now_s = time()
                 if context.logs.last_input_gap_log_time == 0.0 ||
                    (now_s - context.logs.last_input_gap_log_time) >= context.logs.input_gap_log_interval_sec
-                    burst = freeze_set > context.params.gap_freeze_symbols
                     AsyncLogger.log_async("ISDBTFrameSync: input_gap_ms=",
                             round(gap_ms, digits = 3),
                             " expected_symbol_ms=",
@@ -608,14 +677,14 @@ function input!(context::ISDBTFrameSyncContext, samples::AbstractVector{ComplexF
                             round(gap_thresh_ms, digits = 3),
                             " huge=",
                             huge_gap,
+                            " hard_single=",
+                            hard_single_gap,
                             " streak=",
                             context.state.input_gap_event_streak,
-                            " apply_freeze=",
-                            apply_freeze,
-                            " burst=",
-                            burst,
-                            " freeze_set=",
-                            freeze_set,
+                            " monitor_burst=",
+                            monitor_burst,
+                            " control=",
+                            "stream_time",
                             " count=",
                             context.state.input_gap_count,
                             " freeze_left=",

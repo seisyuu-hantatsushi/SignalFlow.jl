@@ -31,7 +31,7 @@ function CreateWBFM(::Type{T}, samplerate::Real;
     frame_size < 1 && error("WBFM: frame_size must be at least 1.")
     decimation < 1 && error("WBFM: decimation must be >= 1.")
 
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     outbuf = Vector{Float32}(undef, 0)
     ringbuffer = RingFrameBuffer(T, frame_size, poolsize)

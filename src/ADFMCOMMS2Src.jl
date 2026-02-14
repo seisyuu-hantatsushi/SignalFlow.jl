@@ -6,6 +6,21 @@ import ..SignalFlowBlock
 import ..input!
 import ..RingBuffers: RingFrameBuffer
 import ..AsyncLogger
+import ..SeqTrace
+
+function __init__()
+    # Avoid mutating ADFMCOMMS2 during precompile; patch only at runtime if needed.
+    if ccall(:jl_generating_output, Cint, ()) != 0
+        return
+    end
+    try
+        if !isdefined(ADFMCOMMS2, :eprintln)
+            Base.eval(ADFMCOMMS2, :(global eprintln = (args...)->Base.println(stderr, args...)))
+        end
+    catch
+    end
+end
+
 
 mutable struct ADFMCOMMS2Src{T} <: SignalFlowBlock 
     running::Base.Threads.Atomic{Bool}
@@ -191,9 +206,9 @@ end
 end
 
 function open(::Type{T}, uri::String, frequency::UInt64, samplerate::UInt32, bandwidth::UInt32;
-              poolsize::Int = 256,
+              poolsize::Int = 384,
               chunk_size::Int = 32768,
-              dispatch_burst::Int = 8,
+              dispatch_burst::Int = 32,
               drop_on_backpressure::Bool = true,
               backpressure_log_interval::Int = 200) where {T}
     poolsize < 1 && error("ADFMCOMMS2Src: poolsize must be at least 1.")
@@ -210,7 +225,7 @@ function open(::Type{T}, uri::String, frequency::UInt64, samplerate::UInt32, ban
     rb_frame_size = min(frame_size, chunk_size)
     ringbuffer = RingFrameBuffer(T, rb_frame_size, poolsize)
     
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     src = ADFMCOMMS2Src(Base.Threads.Atomic{Bool}(true),
                         adapter,
@@ -236,10 +251,7 @@ function close!(context::ADFMCOMMS2Src)
 
     context.running[] = false
     # Stop device first to unblock recv! / iio_buffer_refill wait promptly.
-    try
-        ADFMCOMMS2.stop!(context.adapter)
-    catch
-    end
+    stop_adapter_quietly!(context.adapter)
     if context.recv_task !== nothing
         Base.disable_sigint() do
             try
@@ -265,6 +277,18 @@ function close!(context::ADFMCOMMS2Src)
 
 end
 
+function stop_adapter_quietly!(adapter)
+    # libiio may emit benign shutdown noise (e.g. READ ... -9) on stderr when canceling buffers.
+    try
+        redirect_stderr(devnull) do
+            ADFMCOMMS2.stop!(adapter)
+        end
+    catch
+        # Keep shutdown best-effort.
+    end
+    return nothing
+end
+
 function recv_task!(context::ADFMCOMMS2Src{T}) where {T}
     total_recv_samples::UInt64 = 0
     prev_total_recv_samples::UInt64 = 0
@@ -282,8 +306,19 @@ function recv_task!(context::ADFMCOMMS2Src{T}) where {T}
         while context.running[]
             now_time = time_ns()
 
-            recv_size = ADFMCOMMS2.recv!(context.adapter, recv_buffer)
+            recv_size = try
+                ADFMCOMMS2.recv!(context.adapter, recv_buffer)
+            catch e
+                # During shutdown, ADFMCOMMS2 may fail in its closed-adapter path.
+                if !context.running[] || !context.adapter.running[]
+                    break
+                end
+                rethrow()
+            end
             if recv_size < 0
+                if !context.running[] || !context.adapter.running[]
+                    break
+                end
                 error("ADFMCOMMS2Src: RF Receive Error")
             end
             recv_done_ns = time_ns()
@@ -324,6 +359,12 @@ function recv_task!(context::ADFMCOMMS2Src{T}) where {T}
                 buf = context.ringbuffer.bufs[idx]
                 copyto!(buf.buf, 1, recv_buffer, offset, chunk_n)
                 buf.store_size = chunk_n
+                if SeqTrace.is_enabled()
+                    seq = SeqTrace.next_seq!()
+                    SeqTrace.set_seq!(buf.buf, seq)
+                    # Source emits raw chunks; continuity is checked downstream at symbol/frame level.
+                    SeqTrace.log_out!("ADFMCOMMS2Src", context, seq; strict = false)
+                end
                 put!(context.ringbuffer.fullQ, idx)
                 offset += chunk_n
             end
@@ -362,12 +403,11 @@ function recv_task!(context::ADFMCOMMS2Src{T}) where {T}
         end
         
     catch e
-        AsyncLogger.log_async("ADFMCOMMS2Src error: ", e)
+        if context.running[] && context.adapter.running[]
+            AsyncLogger.log_async("ADFMCOMMS2Src error: ", e)
+        end
     end
-    try
-        ADFMCOMMS2.stop!(context.adapter)
-    catch
-    end
+    stop_adapter_quietly!(context.adapter)
 end
 
 function dispatch_task!(context::ADFMCOMMS2Src{T}, dispatch_burst::Int) where {T}

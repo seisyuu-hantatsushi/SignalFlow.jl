@@ -3,6 +3,7 @@ module GainBlock
 import ..SignalFlowBlock
 import ..input!
 import ..RingBuffers: RingFrameBuffer
+import ..SeqTrace
 
 mutable struct GainBlockContext <: SignalFlowBlock
     running::Base.Threads.Atomic{Bool}
@@ -20,7 +21,7 @@ function CreateGainBlock(::Type{T}; gain::Real = 1.0, frame_size::Int, poolsize:
     frame_size < 1 && error("GainBlock: frame_size must be >= 1.")
     poolsize < 1 && error("GainBlock: poolsize must be at least 1.")
 
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     ctx = GainBlockContext(Base.Threads.Atomic{Bool}(true),
                            Float64(gain),
@@ -42,9 +43,18 @@ function task!(context::GainBlockContext)
                 rd_index = take!(context.ringbuffer.fullQ)
                 rd_buffer = context.ringbuffer.bufs[rd_index]
                 if rd_buffer.store_size == context.frame_size
+                    in_seq = UInt64(0)
+                    if SeqTrace.is_enabled()
+                        in_seq = SeqTrace.get_seq(rd_buffer.buf)
+                        SeqTrace.log_in!("GainBlock", context, in_seq; strict = false)
+                    end
                     g = Float32(context.gain)
                     @inbounds for k in 1:context.frame_size
                         context.outbuf[k] = rd_buffer.buf[k] * g
+                    end
+                    if SeqTrace.is_enabled()
+                        SeqTrace.set_seq!(context.outbuf, in_seq)
+                        SeqTrace.log_out!("GainBlock", context, in_seq; strict = false)
                     end
                     while isready(context.new_sinks)
                         push!(context.sinks, take!(context.new_sinks))
@@ -81,6 +91,9 @@ function input!(context::GainBlockContext, samples::AbstractVector{ComplexF32}, 
         idx = take!(context.ringbuffer.freeQ)
         buf = context.ringbuffer.bufs[idx]
         copyto!(buf.buf, 1, samples, 1, actual_size)
+        if SeqTrace.is_enabled()
+            SeqTrace.inherit_seq!(samples, buf.buf)
+        end
         buf.store_size = actual_size
         put!(context.ringbuffer.fullQ, idx)
     else

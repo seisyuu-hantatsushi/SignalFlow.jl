@@ -16,6 +16,7 @@ mutable struct BandSNREstimatorContext <: SignalFlowBlock
     running::Base.Threads.Atomic{Bool}
     samplerate::Float64
     fft_size::Int
+    label::String
     window::Vector{Float32}
     tmp::Vector{ComplexF32}
     spec::Vector{ComplexF32}
@@ -81,6 +82,7 @@ function CreateBandSNREstimator(; samplerate::Real,
                                  fft_size::Int = 4096,
                                  signal_band::Tuple{<:Real,<:Real},
                                  noise_bands::AbstractVector{<:Tuple{<:Real,<:Real}},
+                                 label::AbstractString = "BandSNREstimator",
                                  window::WindowType = Hann,
                                  enable_stats::Bool = false,
                                  stats_len::Int = 300,
@@ -106,12 +108,13 @@ function CreateBandSNREstimator(; samplerate::Real,
     sig_idx = unshift_indices(sig_idx, fft_size)
     noise_idx = unshift_indices(noise_idx, fft_size)
 
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     now = time()
     ctx = BandSNREstimatorContext(Base.Threads.Atomic{Bool}(true),
                                   Float64(samplerate),
                                   fft_size,
+                                  String(label),
                                   window_coeffs(fft_size, window),
                                   Vector{ComplexF32}(undef, fft_size),
                                   Vector{ComplexF32}(undef, fft_size),
@@ -216,8 +219,9 @@ function task!(context::BandSNREstimatorContext)
                     end
                     if context.log_stats
                         now = time()
-                        if now - context.last_log_time >= context.log_interval
-                            println("BandSNREstimator: snr=", round(snr_db; digits = 2), " dB")
+                            if now - context.last_log_time >= context.log_interval
+                            println("BandSNREstimator[", context.label, "]: snr=",
+                                    round(snr_db; digits = 2), " dB")
                             context.last_log_time = now
                         end
                     end

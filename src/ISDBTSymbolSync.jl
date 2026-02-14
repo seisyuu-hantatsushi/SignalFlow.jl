@@ -3,6 +3,8 @@ module ISDBTSymbolSync
 import ..SignalFlowBlock
 import ..input!
 import ..RingBuffers: RingFrameBuffer
+import ..SeqTrace
+import ..AsyncLogger
 
 using GLMakie
 
@@ -58,6 +60,9 @@ mutable struct ISDBTSymbolSyncContext <: SignalFlowBlock
     buffer_head::Int
     buffer_size::Int
     outbuf::Vector{ComplexF32}
+    current_in_seq::UInt64
+    symbol_seq::UInt64
+    last_symbol_seq::UInt64
     last_offset::Int
     last_metric::Float64
     symbol_counter::Int
@@ -146,7 +151,7 @@ function CreateISDBTSymbolSync(; mode::Int = 3,
     stats_avg_len < 1 && error("ISDBTSymbolSync: stats_avg_len must be at least 1.")
     stats_update_interval < 1 && error("ISDBTSymbolSync: stats_update_interval must be >= 1.")
 
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     buffer = Vector{ComplexF32}(undef, frame_size * 2)
     outbuf = Vector{ComplexF32}(undef, nfft)
@@ -196,6 +201,9 @@ function CreateISDBTSymbolSync(; mode::Int = 3,
                                  1,
                                  0,
                                  outbuf,
+                                 UInt64(0),
+                                 UInt64(0),
+                                 UInt64(0),
                                  0,
                                  0.0,
                                  0,
@@ -460,8 +468,24 @@ function process_buffer!(context::ISDBTSymbolSyncContext)
             while isready(context.new_sinks)
                 push!(context.sinks, take!(context.new_sinks))
             end
+            if SeqTrace.is_enabled()
+                context.symbol_seq += UInt64(1)
+                SeqTrace.set_seq!(context.outbuf, context.symbol_seq)
+                SeqTrace.log_out!("ISDBTSymbolSync", context, context.symbol_seq)
+                if context.last_symbol_seq != 0 && context.symbol_seq != context.last_symbol_seq + 1
+                    AsyncLogger.log_async("SeqTrace[ISDBTSymbolSync] out_jump expected=",
+                                          Int64(context.last_symbol_seq + 1),
+                                          " actual=", Int64(context.symbol_seq),
+                                          " delta=", Int64(context.symbol_seq) - Int64(context.last_symbol_seq))
+                end
+                context.last_symbol_seq = context.symbol_seq
+            end
             for sink in context.sinks
-                input!(sink, context.outbuf, context.nfft)
+                ret = input!(sink, context.outbuf, context.nfft)
+                if ret == -1
+                    AsyncLogger.log_async("ISDBTSymbolSync: sink_backpressure sink=",
+                                          string(typeof(sink)))
+                end
             end
         end
         if context.enable_stats && context.statsQ !== nothing
@@ -507,6 +531,12 @@ function task!(context::ISDBTSymbolSyncContext)
                 rd_buffer = context.ringbuffer.bufs[rd_index]
                 n = rd_buffer.store_size
                 if n > 0
+                    context.current_in_seq = UInt64(0)
+                    if SeqTrace.is_enabled()
+                        in_seq = SeqTrace.get_seq(rd_buffer.buf)
+                        context.current_in_seq = in_seq
+                        SeqTrace.log_in!("ISDBTSymbolSync", context, in_seq; strict = false)
+                    end
                     ensure_append_space!(context, n)
                     dst = context.buffer_head + context.buffer_size
                     copyto!(context.buffer, dst, rd_buffer.buf, 1, n)
@@ -586,6 +616,9 @@ function input!(context::ISDBTSymbolSyncContext, samples::AbstractVector{Complex
             return -1
         else
             write_frame = context.ringbuffer.bufs[context.holdbuf]
+            if SeqTrace.is_enabled() && write_frame.store_size == 0
+                SeqTrace.inherit_seq!(samples, write_frame.buf)
+            end
             copy_size = min(remain_size, context.ringbuffer.frame_size - write_frame.store_size)
             copyto!(write_frame.buf, write_frame.store_size + 1, samples, actual_size - remain_size + 1, copy_size)
             write_frame.store_size += copy_size

@@ -81,7 +81,7 @@ function CreateISDBTPilotExtractor(; nfft::Int = 8192,
         output_refs[phase] = output_refs[phase][1:len0]
     end
 
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     outbuf = Vector{ComplexF32}(undef, len0)
 

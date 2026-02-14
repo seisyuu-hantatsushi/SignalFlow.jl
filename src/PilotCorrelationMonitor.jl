@@ -85,7 +85,7 @@ function CreatePilotCorrelationMonitor(; nfft::Int = 8192,
         build_pilot_sets(nfft, pilot_spacing, pilot_offset0, pilot_offset_step,
                          segment_carriers, segment_index)
 
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     ctx = PilotCorrelationMonitorContext(Base.Threads.Atomic{Bool}(true),
                                          nfft,

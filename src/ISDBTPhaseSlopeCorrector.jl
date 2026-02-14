@@ -4,6 +4,7 @@ import ..SignalFlowBlock
 import ..input!
 import ..RingBuffers: RingFrameBuffer
 import ..ISDBTPRBS
+import ..SeqTrace
 
 const LOG_LOCK = ReentrantLock()
 
@@ -25,7 +26,15 @@ mutable struct ISDBTPhaseSlopeCorrectorContext <: SignalFlowBlock
     pilot_trim_ratio::Float64
     max_fit_rms_on::Float64
     max_fit_rms_off::Float64
+    min_used_pilots::Int
+    min_used_ratio::Float64
+    update_confirm::Int
+    update_fail_confirm::Int
+    min_slope_step::Float64
+    min_intercept_step::Float64
     update_enabled::Bool
+    fit_pass_count::Int
+    fit_fail_count::Int
     auto_sp_phase::Bool
     symbol_index_ref::Union{Nothing,Base.Threads.Atomic{Int}}
     gap_freeze_ref::Union{Nothing,Base.Threads.Atomic{Int}}
@@ -152,6 +161,12 @@ function CreateISDBTPhaseSlopeCorrector(; nfft::Int = 8192,
                                         pilot_trim_ratio::Real = 0.2,
                                         max_fit_rms::Real = 0.4,
                                         max_fit_rms_off::Union{Nothing,Real} = nothing,
+                                        min_used_pilots::Int = 18,
+                                        min_used_ratio::Real = 0.5,
+                                        update_confirm::Int = 2,
+                                        update_fail_confirm::Int = 2,
+                                        min_slope_step::Real = 5e-5,
+                                        min_intercept_step_deg::Real = 0.25,
                                         auto_sp_phase::Bool = true,
                                         symbol_index_ref::Union{Nothing,Base.Threads.Atomic{Int}} = nothing,
                                         gap_freeze_ref::Union{Nothing,Base.Threads.Atomic{Int}} = nothing,
@@ -166,6 +181,12 @@ function CreateISDBTPhaseSlopeCorrector(; nfft::Int = 8192,
     pilot_min_mag < 0 && error("ISDBTPhaseSlopeCorrector: pilot_min_mag must be >= 0.")
     (0.0 <= pilot_trim_ratio < 0.5) || error("ISDBTPhaseSlopeCorrector: pilot_trim_ratio must be in [0, 0.5).")
     max_fit_rms <= 0 && error("ISDBTPhaseSlopeCorrector: max_fit_rms must be > 0.")
+    min_used_pilots < 1 && error("ISDBTPhaseSlopeCorrector: min_used_pilots must be >= 1.")
+    (0.0 < min_used_ratio <= 1.0) || error("ISDBTPhaseSlopeCorrector: min_used_ratio must be in (0, 1].")
+    update_confirm < 1 && error("ISDBTPhaseSlopeCorrector: update_confirm must be >= 1.")
+    update_fail_confirm < 1 && error("ISDBTPhaseSlopeCorrector: update_fail_confirm must be >= 1.")
+    min_slope_step < 0 && error("ISDBTPhaseSlopeCorrector: min_slope_step must be >= 0.")
+    min_intercept_step_deg < 0 && error("ISDBTPhaseSlopeCorrector: min_intercept_step_deg must be >= 0.")
     poolsize < 1 && error("ISDBTPhaseSlopeCorrector: poolsize must be at least 1.")
     log_interval <= 0 && error("ISDBTPhaseSlopeCorrector: log_interval must be > 0.")
     fit_rms_on = Float64(max_fit_rms)
@@ -191,7 +212,7 @@ function CreateISDBTPhaseSlopeCorrector(; nfft::Int = 8192,
                                                 prbs_bits)
     max_pilots = max(1, maximum(length, bins_by_phase))
 
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     ctx = ISDBTPhaseSlopeCorrectorContext(Base.Threads.Atomic{Bool}(true),
                                           nfft,
@@ -210,7 +231,15 @@ function CreateISDBTPhaseSlopeCorrector(; nfft::Int = 8192,
                                           Float64(pilot_trim_ratio),
                                           fit_rms_on,
                                           fit_rms_off,
+                                          min_used_pilots,
+                                          Float64(min_used_ratio),
+                                          update_confirm,
+                                          update_fail_confirm,
+                                          Float64(min_slope_step),
+                                          Float64(min_intercept_step_deg) * Float64(pi) / 180.0,
                                           false,
+                                          0,
+                                          0,
                                           auto_sp_phase,
                                           symbol_index_ref,
                                           gap_freeze_ref,
@@ -246,6 +275,11 @@ function task!(context::ISDBTPhaseSlopeCorrectorContext)
                 rd_index = take!(context.ringbuffer.fullQ)
                 rd_buffer = context.ringbuffer.bufs[rd_index]
                 if rd_buffer.store_size == context.nfft
+                    in_seq = UInt64(0)
+                    if SeqTrace.is_enabled()
+                        in_seq = SeqTrace.get_seq(rd_buffer.buf)
+                        SeqTrace.log_in!("PhaseSlope", context, in_seq)
+                    end
                     if context.symbol_index_ref !== nothing
                         context.symbol_index = context.symbol_index_ref[]
                     end
@@ -375,18 +409,39 @@ function task!(context::ISDBTPhaseSlopeCorrectorContext)
                         fit_rms = cnt_fit > 0 ? sqrt(fit_rms / cnt_fit) : 0.0
 
                         freeze_active = context.gap_freeze_ref !== nothing && context.gap_freeze_ref[] > 0
+                        used_gate_min = max(context.min_used_pilots,
+                                            ceil(Int, context.min_used_ratio * n))
+                        fit_input_ok = used >= used_gate_min
                         if freeze_active
                             context.update_enabled = false
+                            context.fit_pass_count = 0
+                            context.fit_fail_count = 0
                         elseif context.update_enabled
-                            if fit_rms > context.max_fit_rms_off
-                                context.update_enabled = false
+                            if !fit_input_ok || fit_rms > context.max_fit_rms_off
+                                context.fit_fail_count += 1
+                                context.fit_pass_count = 0
+                                if context.fit_fail_count >= context.update_fail_confirm
+                                    context.update_enabled = false
+                                    context.fit_fail_count = 0
+                                end
+                            else
+                                context.fit_fail_count = 0
                             end
-                        elseif fit_rms <= context.max_fit_rms_on
-                            context.update_enabled = true
+                        elseif fit_input_ok && fit_rms <= context.max_fit_rms_on
+                            context.fit_pass_count += 1
+                            if context.fit_pass_count >= context.update_confirm
+                                context.update_enabled = true
+                                context.fit_pass_count = 0
+                            end
+                        else
+                            context.fit_pass_count = 0
                         end
 
                         if context.update_enabled && !freeze_active
                             slope_delta = context.alpha * (slope - context.slope)
+                            if abs(slope_delta) < context.min_slope_step
+                                slope_delta = 0.0
+                            end
                             if slope_delta > context.max_slope_step
                                 slope_delta = context.max_slope_step
                             elseif slope_delta < -context.max_slope_step
@@ -395,30 +450,45 @@ function task!(context::ISDBTPhaseSlopeCorrectorContext)
                             context.slope += slope_delta
                             err_i = wrap_phase(intercept - context.intercept)
                             int_delta = context.alpha * err_i
+                            if abs(int_delta) < context.min_intercept_step
+                                int_delta = 0.0
+                            end
                             if int_delta > context.max_intercept_step
                                 int_delta = context.max_intercept_step
                             elseif int_delta < -context.max_intercept_step
                                 int_delta = -context.max_intercept_step
                             end
+                            # Report update=true only when either parameter is actually changed.
+                            update_applied = (slope_delta != 0.0) || (int_delta != 0.0)
                             context.intercept = wrap_phase(context.intercept + int_delta)
-                            update_applied = true
                         end
                     end
                     if context.log_stats
                         now = time()
                         if now - context.last_log_time >= context.log_interval
                             rms = 0.0
+                            residual_p95 = 0.0
                             if used > 0
                                 cnt = 0
                                 @inbounds for i in 1:n
                                     if used_mask[i]
                                         est = context.slope * ks[i] + context.intercept
                                         e = wrap_phase(phases[i] - est)
+                                        ae = abs(e)
                                         rms += e * e
                                         cnt += 1
+                                        context.residual_buf[cnt] = ae
+                                        context.residual_sorted_buf[cnt] = ae
                                     end
                                 end
-                                rms = cnt > 0 ? sqrt(rms / cnt) : 0.0
+                                if cnt > 0
+                                    rms = sqrt(rms / cnt)
+                                    sort!(@view(context.residual_sorted_buf[1:cnt]))
+                                    p95_idx = clamp(ceil(Int, 0.95 * cnt), 1, cnt)
+                                    residual_p95 = context.residual_sorted_buf[p95_idx]
+                                else
+                                    rms = 0.0
+                                end
                             end
                             lock(LOG_LOCK) do
                                 println("PhaseSlope: slope=",
@@ -426,8 +496,13 @@ function task!(context::ISDBTPhaseSlopeCorrectorContext)
                                         " rad/bin, intercept=",
                                         round(context.intercept, digits = 4),
                                         " rms=", round(rms, digits = 3),
+                                        " residual_rms_deg=", round(rms * 180 / Float64(π), digits = 2),
+                                        " residual_p95_deg=", round(residual_p95 * 180 / Float64(π), digits = 2),
                                         " fit_rms=", round(fit_rms, digits = 3),
+                                        " pass=", context.fit_pass_count,
+                                        " fail=", context.fit_fail_count,
                                         " used=", used, "/", n,
+                                        " used_gate_min=", used_gate_min,
                                         " gate=", context.update_enabled,
                                         " updated=", update_applied)
                             end
@@ -447,6 +522,10 @@ function task!(context::ISDBTPhaseSlopeCorrectorContext)
                     end
                     context.symbol_index += 1
 
+                    if SeqTrace.is_enabled() && in_seq != 0
+                        SeqTrace.set_seq!(context.outbuf, in_seq)
+                        SeqTrace.log_out!("PhaseSlope", context, in_seq)
+                    end
                     while isready(context.new_sinks)
                         push!(context.sinks, take!(context.new_sinks))
                     end
@@ -498,6 +577,9 @@ function input!(context::ISDBTPhaseSlopeCorrectorContext, samples::AbstractVecto
     idx = take!(context.ringbuffer.freeQ)
     buf = context.ringbuffer.bufs[idx]
     copyto!(buf.buf, 1, samples, 1, actual_size)
+    if SeqTrace.is_enabled()
+        SeqTrace.inherit_seq!(samples, buf.buf)
+    end
     buf.store_size = actual_size
     put!(context.ringbuffer.fullQ, idx)
 

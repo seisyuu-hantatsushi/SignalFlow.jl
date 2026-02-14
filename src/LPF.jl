@@ -75,7 +75,7 @@ function CreateLPF(::Type{T}, samplerate::Real, cutoff::Real;
         DSP.DF2TFilter(sos, zeros(T, 2, length(sos.biquads)))
     end
 
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     outbuf = Vector{T}(undef, 0)
     ringbuffer = RingFrameBuffer(T, frame_size, poolsize)

@@ -104,7 +104,7 @@ function CreateWBFMStereoDemod(::Type{T}, samplerate::Real;
     pll = PLLState(0.0, f0, alpha, beta)
 
     ringbuffer = RingFrameBuffer(T, frame_size, poolsize)
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
 
     outbuf = output_format == Int16PCM ? Vector{Int16}(undef, 0) : Vector{Float32}(undef, 0)

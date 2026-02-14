@@ -265,7 +265,7 @@ function CreateISDBTDataCarrierExtractor(; nfft::Int = 8192,
         end
     end
 
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     outbuf = Vector{ComplexF32}(undef, len0)
 

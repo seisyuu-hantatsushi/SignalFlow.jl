@@ -3,6 +3,7 @@ module SignalStatsMonitor
 import ..SignalFlowBlock
 import ..input!
 import ..RingBuffers: RingFrameBuffer
+import ..AsyncLogger
 
 mutable struct SignalStatsMonitorContext <: SignalFlowBlock
     running::Base.Threads.Atomic{Bool}
@@ -10,6 +11,9 @@ mutable struct SignalStatsMonitorContext <: SignalFlowBlock
     label::String
     log_interval::Float64
     last_log_time::Float64
+    drop_log_interval::Int
+    dropped_frames::Int
+    input_mismatch_count::Int
     ringbuffer::RingFrameBuffer{ComplexF32}
     holdbuf::Union{Nothing, Int}
     worker::Union{Nothing,Task}
@@ -22,18 +26,23 @@ const LOG_LOCK = ReentrantLock()
 function CreateSignalStatsMonitor(; frame_size::Int,
                                   label::AbstractString,
                                   log_interval::Real = 1.0,
+                                  drop_log_interval::Int = 500,
                                   poolsize::Int = 8)
     frame_size < 1 && error("SignalStatsMonitor: frame_size must be >= 1.")
     poolsize < 1 && error("SignalStatsMonitor: poolsize must be at least 1.")
     log_interval <= 0 && error("SignalStatsMonitor: log_interval must be > 0.")
+    drop_log_interval < 1 && error("SignalStatsMonitor: drop_log_interval must be >= 1.")
 
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     ctx = SignalStatsMonitorContext(Base.Threads.Atomic{Bool}(true),
                                     frame_size,
                                     String(label),
                                     Float64(log_interval),
                                     0.0,
+                                    drop_log_interval,
+                                    0,
+                                    0,
                                     RingFrameBuffer(ComplexF32, frame_size, poolsize),
                                     nothing,
                                     nothing,
@@ -105,7 +114,15 @@ function input!(context::SignalStatsMonitorContext, samples::AbstractVector{Comp
 
     actual_size = min(samples_size, length(samples))
     if actual_size != context.frame_size
-        return -1
+        context.input_mismatch_count += 1
+        if (context.input_mismatch_count % context.drop_log_interval) == 0
+            AsyncLogger.log_async("SignalStatsMonitor[", context.label, "]: dropped_mismatch_frames=",
+                                  context.input_mismatch_count,
+                                  " expected=", context.frame_size,
+                                  " actual=", actual_size)
+        end
+        # Monitoring must not stall the realtime path.
+        return samples_size
     end
 
     if isready(context.ringbuffer.freeQ)
@@ -115,7 +132,13 @@ function input!(context::SignalStatsMonitorContext, samples::AbstractVector{Comp
         buf.store_size = actual_size
         put!(context.ringbuffer.fullQ, idx)
     else
-        return -1
+        context.dropped_frames += 1
+        if (context.dropped_frames % context.drop_log_interval) == 0
+            AsyncLogger.log_async("SignalStatsMonitor[", context.label, "]: dropped_backpressure_frames=",
+                                  context.dropped_frames)
+        end
+        # Drop monitor frame under pressure; never backpressure upstream.
+        return samples_size
     end
 
     return samples_size

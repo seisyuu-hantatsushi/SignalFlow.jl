@@ -55,7 +55,7 @@ function CreateBinPowerMonitor(; nfft::Int = 8192,
     isempty(bins_f) && error("BinPowerMonitor: bins must include at least one valid bin.")
     bband = band_bins(nfft, Float64(samplerate), Float64(band_limit_hz))
 
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     ctx = BinPowerMonitorContext(Base.Threads.Atomic{Bool}(true),
                                  nfft,

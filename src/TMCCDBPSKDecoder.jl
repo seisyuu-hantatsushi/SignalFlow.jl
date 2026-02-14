@@ -4,6 +4,7 @@ import ..SignalFlowBlock
 import ..input!
 import ..RingBuffers: RingFrameBuffer
 import ..AsyncLogger
+import ..SeqTrace
 
 mutable struct TMCCDBPSKDecoderContext <: SignalFlowBlock
     running::Base.Threads.Atomic{Bool}
@@ -131,7 +132,7 @@ function CreateTMCCDBPSKDecoder(; nfft::Int = 8192,
         end
     end
 
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     ctx = TMCCDBPSKDecoderContext(Base.Threads.Atomic{Bool}(true),
                                   nfft,
@@ -194,6 +195,11 @@ function task!(context::TMCCDBPSKDecoderContext)
                 rd_index = take!(context.ringbuffer.fullQ)
                 rd_buffer = context.ringbuffer.bufs[rd_index]
                 if rd_buffer.store_size == context.nfft
+                    in_seq = UInt64(0)
+                    if SeqTrace.is_enabled()
+                        in_seq = SeqTrace.get_seq(rd_buffer.buf)
+                        SeqTrace.log_in!("TMCCDBPSK", context, in_seq)
+                    end
                     copyto!(context.outbuf, 1, rd_buffer.buf, 1, context.nfft)
                     if context.symbol_index_ref !== nothing
                         context.symbol_counter = context.symbol_index_ref[]
@@ -416,6 +422,10 @@ function task!(context::TMCCDBPSKDecoderContext)
                     end
                     context.symbol_counter += 1
 
+                    if SeqTrace.is_enabled() && in_seq != 0
+                        SeqTrace.set_seq!(context.outbuf, in_seq)
+                        SeqTrace.log_out!("TMCCDBPSK", context, in_seq)
+                    end
                     while isready(context.new_sinks)
                         push!(context.sinks, take!(context.new_sinks))
                     end
@@ -451,6 +461,9 @@ function input!(context::TMCCDBPSKDecoderContext, samples::AbstractVector{Comple
         idx = take!(context.ringbuffer.freeQ)
         buf = context.ringbuffer.bufs[idx]
         copyto!(buf.buf, 1, samples, 1, actual_size)
+        if SeqTrace.is_enabled()
+            SeqTrace.inherit_seq!(samples, buf.buf)
+        end
         buf.store_size = actual_size
         put!(context.ringbuffer.fullQ, idx)
     else

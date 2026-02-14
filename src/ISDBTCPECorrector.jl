@@ -4,6 +4,7 @@ import ..SignalFlowBlock
 import ..input!
 import ..RingBuffers: RingFrameBuffer
 import ..ISDBTPRBS
+import ..SeqTrace
 
 const LOG_LOCK = ReentrantLock()
 
@@ -24,7 +25,13 @@ mutable struct ISDBTCPECorrectorContext <: SignalFlowBlock
     pilot_trim_ratio::Float64
     min_update_conf_on::Float64
     min_update_conf_off::Float64
+    conf_gain_floor::Float64
+    update_confirm::Int
+    update_fail_confirm::Int
+    min_phase_step::Float64
     update_enabled::Bool
+    conf_pass_count::Int
+    conf_fail_count::Int
     auto_sp_phase::Bool
     auto_sp_phase_interval::Int
     auto_phase_countdown::Int
@@ -32,6 +39,11 @@ mutable struct ISDBTCPECorrectorContext <: SignalFlowBlock
     symbol_index_ref::Union{Nothing,Base.Threads.Atomic{Int}}
     gap_freeze_ref::Union{Nothing,Base.Threads.Atomic{Int}}
     cpe_phase::Float64
+    cfo_alpha::Float64
+    cfo_rad_per_sym::Float64
+    cfo_hz::Float64
+    prev_phi::Float64
+    prev_phi_valid::Bool
     log_stats::Bool
     log_interval::Float64
     last_log_time::Float64
@@ -136,6 +148,11 @@ function CreateISDBTCPECorrector(; nfft::Int = 8192,
                                  pilot_trim_ratio::Real = 0.2,
                                  min_update_conf::Real = 0.2,
                                  min_update_conf_off::Union{Nothing,Real} = nothing,
+                                 conf_gain_floor::Real = 0.0,
+                                 update_confirm::Int = 2,
+                                 update_fail_confirm::Int = 2,
+                                 min_phase_step_deg::Real = 0.25,
+                                 cfo_alpha::Real = 0.1,
                                  auto_sp_phase::Bool = true,
                                  auto_sp_phase_interval::Int = 4,
                                  symbol_index_ref::Union{Nothing,Base.Threads.Atomic{Int}} = nothing,
@@ -150,6 +167,11 @@ function CreateISDBTCPECorrector(; nfft::Int = 8192,
     pilot_min_mag < 0 && error("ISDBTCPECorrector: pilot_min_mag must be >= 0.")
     (0.0 <= pilot_trim_ratio < 0.5) || error("ISDBTCPECorrector: pilot_trim_ratio must be in [0, 0.5).")
     (0.0 <= min_update_conf <= 1.0) || error("ISDBTCPECorrector: min_update_conf must be in [0, 1].")
+    (0.0 <= conf_gain_floor <= 1.0) || error("ISDBTCPECorrector: conf_gain_floor must be in [0, 1].")
+    update_confirm < 1 && error("ISDBTCPECorrector: update_confirm must be >= 1.")
+    update_fail_confirm < 1 && error("ISDBTCPECorrector: update_fail_confirm must be >= 1.")
+    min_phase_step_deg < 0 && error("ISDBTCPECorrector: min_phase_step_deg must be >= 0.")
+    (0.0 < cfo_alpha <= 1.0) || error("ISDBTCPECorrector: cfo_alpha must be in (0, 1].")
     auto_sp_phase_interval < 1 && error("ISDBTCPECorrector: auto_sp_phase_interval must be >= 1.")
     poolsize < 1 && error("ISDBTCPECorrector: poolsize must be at least 1.")
     log_interval <= 0 && error("ISDBTCPECorrector: log_interval must be > 0.")
@@ -176,7 +198,7 @@ function CreateISDBTCPECorrector(; nfft::Int = 8192,
                                                 prbs_bits)
     max_pilots = max(1, maximum(length, bins_by_phase))
 
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     ctx = ISDBTCPECorrectorContext(Base.Threads.Atomic{Bool}(true),
                                    nfft,
@@ -194,7 +216,13 @@ function CreateISDBTCPECorrector(; nfft::Int = 8192,
                                    Float64(pilot_trim_ratio),
                                    update_conf_on,
                                    update_conf_off,
+                                   Float64(conf_gain_floor),
+                                   update_confirm,
+                                   update_fail_confirm,
+                                   Float64(min_phase_step_deg) * Float64(pi) / 180.0,
                                    false,
+                                   0,
+                                   0,
                                    auto_sp_phase,
                                    auto_sp_phase_interval,
                                    0,
@@ -202,6 +230,11 @@ function CreateISDBTCPECorrector(; nfft::Int = 8192,
                                    symbol_index_ref,
                                    gap_freeze_ref,
                                    0.0,
+                                   Float64(cfo_alpha),
+                                   0.0,
+                                   0.0,
+                                   0.0,
+                                   false,
                                    log_stats,
                                    Float64(log_interval),
                                    0.0,
@@ -230,6 +263,11 @@ function task!(context::ISDBTCPECorrectorContext)
                 rd_index = take!(context.ringbuffer.fullQ)
                 rd_buffer = context.ringbuffer.bufs[rd_index]
                 if rd_buffer.store_size == context.nfft
+                    in_seq = UInt64(0)
+                    if SeqTrace.is_enabled()
+                        in_seq = SeqTrace.get_seq(rd_buffer.buf)
+                        SeqTrace.log_in!("CPE", context, in_seq)
+                    end
                     if context.symbol_index_ref !== nothing
                         context.symbol_index = context.symbol_index_ref[]
                     end
@@ -282,16 +320,44 @@ function task!(context::ISDBTCPECorrectorContext)
                         end
                     end
                     conf = mag_sum > 0 ? sqrt(s_re * s_re + s_im * s_im) / mag_sum : 0.0
+                    avg_mag = used > 0 ? mag_sum / used : 0.0
+                    if used > 0
+                        phi_now = atan(s_im, s_re)
+                        if context.prev_phi_valid
+                            dphi = wrap_phase(phi_now - context.prev_phi)
+                            context.cfo_rad_per_sym = (1.0 - context.cfo_alpha) * context.cfo_rad_per_sym +
+                                                      context.cfo_alpha * dphi
+                            context.cfo_hz = context.cfo_rad_per_sym * context.samplerate / (2.0 * Float64(pi) * context.nfft)
+                        end
+                        context.prev_phi = phi_now
+                        context.prev_phi_valid = true
+                    end
                     updated = false
+                    conf_gain = 0.0
                     freeze_active = context.gap_freeze_ref !== nothing && context.gap_freeze_ref[] > 0
                     if freeze_active
                         context.update_enabled = false
+                        context.conf_pass_count = 0
+                        context.conf_fail_count = 0
                     elseif context.update_enabled
                         if conf < context.min_update_conf_off
-                            context.update_enabled = false
+                            context.conf_fail_count += 1
+                            context.conf_pass_count = 0
+                            if context.conf_fail_count >= context.update_fail_confirm
+                                context.update_enabled = false
+                                context.conf_fail_count = 0
+                            end
+                        else
+                            context.conf_fail_count = 0
                         end
                     elseif conf >= context.min_update_conf_on
-                        context.update_enabled = true
+                        context.conf_pass_count += 1
+                        if context.conf_pass_count >= context.update_confirm
+                            context.update_enabled = true
+                            context.conf_pass_count = 0
+                        end
+                    else
+                        context.conf_pass_count = 0
                     end
                     if used > 0 && context.update_enabled && !freeze_active
                         phi = atan(s_im, s_re)
@@ -324,28 +390,62 @@ function task!(context::ISDBTCPECorrectorContext)
                             end
                         end
                         err = wrap_phase(phi - context.cpe_phase)
-                        # Low-confidence symbols update more conservatively to reduce phase jitter.
-                        conf_gain = clamp((conf - context.min_update_conf_off) / max(1e-6, 1.0 - context.min_update_conf_off), 0.2, 1.0)
+                        if abs(err) < context.min_phase_step
+                            err = 0.0
+                        end
+                        # Confidence-linked update scaling:
+                        # conf<=off => near-stop, conf>=on => full step, in-between => linear ramp.
+                        conf_gain = if conf <= context.min_update_conf_off
+                            context.conf_gain_floor
+                        elseif conf >= context.min_update_conf_on
+                            1.0
+                        else
+                            span = max(1e-6, context.min_update_conf_on - context.min_update_conf_off)
+                            t = (conf - context.min_update_conf_off) / span
+                            context.conf_gain_floor + (1.0 - context.conf_gain_floor) * t
+                        end
                         delta = context.cpe_alpha * conf_gain * err
                         if delta > context.cpe_max_step
                             delta = context.cpe_max_step
                         elseif delta < -context.cpe_max_step
                             delta = -context.cpe_max_step
                         end
+                        updated = delta != 0.0
                         context.cpe_phase = wrap_phase(context.cpe_phase + delta)
-                        updated = true
                     elseif context.auto_sp_phase
                         context.auto_phase_countdown = 0
                     end
                     if context.log_stats
                         now = time()
                         if now - context.last_log_time >= context.log_interval
+                            residual_rms = 0.0
+                            residual_p95 = 0.0
+                            if used > 0
+                                @inbounds for i in 1:used
+                                    e = abs(wrap_phase(context.angle_buf[i] - context.cpe_phase))
+                                    context.residual_buf[i] = e
+                                    context.residual_sorted_buf[i] = e
+                                    residual_rms += e * e
+                                end
+                                residual_rms = sqrt(residual_rms / used)
+                                sort!(@view(context.residual_sorted_buf[1:used]))
+                                p95_idx = clamp(ceil(Int, 0.95 * used), 1, used)
+                                residual_p95 = context.residual_sorted_buf[p95_idx]
+                            end
                             deg = context.cpe_phase * 180 / Float64(π)
                             lock(LOG_LOCK) do
                                 println("CPE: phase=", round(deg, digits = 2),
                                         " deg conf=", round(conf, digits = 3),
+                                        " avg_mag=", round(avg_mag, digits = 3),
+                                        " residual_rms_deg=", round(residual_rms * 180 / Float64(π), digits = 2),
+                                        " residual_p95_deg=", round(residual_p95 * 180 / Float64(π), digits = 2),
+                                        " residual_cfo_rad_sym=", round(context.cfo_rad_per_sym, digits = 5),
+                                        " residual_cfo_hz=", round(context.cfo_hz, digits = 2),
                                         " used=", used, "/", length(band_pos),
+                                        " pass=", context.conf_pass_count,
+                                        " fail=", context.conf_fail_count,
                                         " gate=", context.update_enabled,
+                                        " conf_gain=", round(conf_gain, digits = 3),
                                         " updated=", updated)
                             end
                             context.last_log_time = now
@@ -363,6 +463,10 @@ function task!(context::ISDBTCPECorrectorContext)
                     end
                     context.symbol_index += 1
 
+                    if SeqTrace.is_enabled() && in_seq != 0
+                        SeqTrace.set_seq!(context.outbuf, in_seq)
+                        SeqTrace.log_out!("CPE", context, in_seq)
+                    end
                     while isready(context.new_sinks)
                         push!(context.sinks, take!(context.new_sinks))
                     end
@@ -414,6 +518,9 @@ function input!(context::ISDBTCPECorrectorContext, samples::AbstractVector{Compl
     idx = take!(context.ringbuffer.freeQ)
     buf = context.ringbuffer.bufs[idx]
     copyto!(buf.buf, 1, samples, 1, actual_size)
+    if SeqTrace.is_enabled()
+        SeqTrace.inherit_seq!(samples, buf.buf)
+    end
     buf.store_size = actual_size
     put!(context.ringbuffer.fullQ, idx)
 

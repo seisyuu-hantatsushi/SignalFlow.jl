@@ -18,7 +18,7 @@ function CreateRateMonitor(::Type{T};
                            label::AbstractString = "RateMonitor",
                            report_interval::Real = 1.0) where {T}
     report_interval <= 0 && error("RateMonitor: report_interval must be positive.")
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     now = time()
     ctx = RateMonitorContext{T}(Base.Threads.Atomic{Bool}(true),

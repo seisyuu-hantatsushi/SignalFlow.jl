@@ -85,6 +85,16 @@ function fftshift(v::AbstractVector)
     return vcat(view(v, h + 1:n), view(v, 1:h))
 end
 
+function log_task_error(prefix::AbstractString, e::Exception)
+    if e isa MethodError
+        sig = join(map(typeof, e.args), ", ")
+        println(prefix, " MethodError in ", e.f, " for (", sig, ")")
+    else
+        println(prefix, " ", e)
+    end
+    return nothing
+end
+
 function process_samples!(context::ViewContext{ComplexF32}, samples::AbstractVector{ComplexF32}, n::Integer)
     i = 1
     fft_size = length(context.fft_buf)
@@ -287,7 +297,7 @@ function task!(context::ViewContext{T}) where {T}
         end
     catch e
         if !(e isa InterruptException)
-            println("FFTView task error: ", e)
+            log_task_error("FFTView task error:", e)
         end
     end
     return nothing
@@ -308,7 +318,7 @@ function update_task!(context::ViewContext{T}) where{T}
         end
     catch e
         if !(e isa InterruptException)
-            println("FFTView update error: ", e)
+            log_task_error("FFTView update error:", e)
         end
     end
     return nothing

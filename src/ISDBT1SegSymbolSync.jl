@@ -109,7 +109,7 @@ function CreateISDBT1SegSymbolSync(; input_samplerate::Real,
     ncp < 1 && error("ISDBT1SegSymbolSync: CP length must be at least 1.")
     symbol_len = nfft + ncp
 
-    new_sinks = Channel{SignalFlowBlock}(4)
+    new_sinks = Channel{SignalFlowBlock}(64)
     sinks = Vector{SignalFlowBlock}()
     buffer = Vector{ComplexF32}(undef, 0)
     outbuf = Vector{ComplexF32}(undef, nfft)
