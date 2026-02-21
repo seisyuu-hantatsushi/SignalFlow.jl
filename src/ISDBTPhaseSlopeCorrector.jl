@@ -32,6 +32,7 @@ mutable struct ISDBTPhaseSlopeCorrectorContext <: SignalFlowBlock
     update_fail_confirm::Int
     min_slope_step::Float64
     min_intercept_step::Float64
+    force_update_eps::Float64
     update_enabled::Bool
     fit_pass_count::Int
     fit_fail_count::Int
@@ -56,6 +57,13 @@ mutable struct ISDBTPhaseSlopeCorrectorContext <: SignalFlowBlock
     ringbuffer::RingFrameBuffer{ComplexF32}
     holdbuf::Union{Nothing, Int}
     input_overrun_count::Int
+    skip_freeze_count::UInt64
+    skip_gate_count::UInt64
+    skip_fit_input_count::UInt64
+    skip_fit_rms_count::UInt64
+    skip_small_delta_count::UInt64
+    skip_invalid_fit_count::UInt64
+    force_update_count::UInt64
     worker::Union{Nothing,Task}
     new_sinks::Channel{SignalFlowBlock}
     sinks::Vector{SignalFlowBlock}
@@ -167,6 +175,7 @@ function CreateISDBTPhaseSlopeCorrector(; nfft::Int = 8192,
                                         update_fail_confirm::Int = 2,
                                         min_slope_step::Real = 5e-5,
                                         min_intercept_step_deg::Real = 0.25,
+                                        force_update_eps::Real = 0.0,
                                         auto_sp_phase::Bool = true,
                                         symbol_index_ref::Union{Nothing,Base.Threads.Atomic{Int}} = nothing,
                                         gap_freeze_ref::Union{Nothing,Base.Threads.Atomic{Int}} = nothing,
@@ -187,6 +196,7 @@ function CreateISDBTPhaseSlopeCorrector(; nfft::Int = 8192,
     update_fail_confirm < 1 && error("ISDBTPhaseSlopeCorrector: update_fail_confirm must be >= 1.")
     min_slope_step < 0 && error("ISDBTPhaseSlopeCorrector: min_slope_step must be >= 0.")
     min_intercept_step_deg < 0 && error("ISDBTPhaseSlopeCorrector: min_intercept_step_deg must be >= 0.")
+    force_update_eps < 0 && error("ISDBTPhaseSlopeCorrector: force_update_eps must be >= 0.")
     poolsize < 1 && error("ISDBTPhaseSlopeCorrector: poolsize must be at least 1.")
     log_interval <= 0 && error("ISDBTPhaseSlopeCorrector: log_interval must be > 0.")
     fit_rms_on = Float64(max_fit_rms)
@@ -237,6 +247,7 @@ function CreateISDBTPhaseSlopeCorrector(; nfft::Int = 8192,
                                           update_fail_confirm,
                                           Float64(min_slope_step),
                                           Float64(min_intercept_step_deg) * Float64(pi) / 180.0,
+                                          Float64(force_update_eps),
                                           false,
                                           0,
                                           0,
@@ -261,6 +272,13 @@ function CreateISDBTPhaseSlopeCorrector(; nfft::Int = 8192,
                                           RingFrameBuffer(ComplexF32, nfft, poolsize),
                                           nothing,
                                           0,
+                                          UInt64(0),
+                                          UInt64(0),
+                                          UInt64(0),
+                                          UInt64(0),
+                                          UInt64(0),
+                                          UInt64(0),
+                                          UInt64(0),
                                           nothing,
                                           new_sinks,
                                           sinks)
@@ -394,6 +412,9 @@ function task!(context::ISDBTPhaseSlopeCorrectorContext)
                     denom = wsum * sum_k2 - sum_k * sum_k
                     fit_rms = 0.0
                     update_applied = false
+                    force_update_applied = false
+                    used_gate_min = 0
+                    freeze_active = context.gap_freeze_ref !== nothing && context.gap_freeze_ref[] > 0
                     if denom != 0.0 && wsum > 0
                         slope = (wsum * sum_kp - sum_k * sum_p) / denom
                         intercept = (sum_p - slope * sum_k) / wsum
@@ -408,16 +429,18 @@ function task!(context::ISDBTPhaseSlopeCorrectorContext)
                         end
                         fit_rms = cnt_fit > 0 ? sqrt(fit_rms / cnt_fit) : 0.0
 
-                        freeze_active = context.gap_freeze_ref !== nothing && context.gap_freeze_ref[] > 0
                         used_gate_min = max(context.min_used_pilots,
                                             ceil(Int, context.min_used_ratio * n))
                         fit_input_ok = used >= used_gate_min
                         if freeze_active
+                            context.skip_freeze_count += 1
                             context.update_enabled = false
                             context.fit_pass_count = 0
                             context.fit_fail_count = 0
                         elseif context.update_enabled
                             if !fit_input_ok || fit_rms > context.max_fit_rms_off
+                                !fit_input_ok && (context.skip_fit_input_count += 1)
+                                fit_rms > context.max_fit_rms_off && (context.skip_fit_rms_count += 1)
                                 context.fit_fail_count += 1
                                 context.fit_pass_count = 0
                                 if context.fit_fail_count >= context.update_fail_confirm
@@ -460,8 +483,27 @@ function task!(context::ISDBTPhaseSlopeCorrectorContext)
                             end
                             # Report update=true only when either parameter is actually changed.
                             update_applied = (slope_delta != 0.0) || (int_delta != 0.0)
+                            !update_applied && (context.skip_small_delta_count += 1)
                             context.intercept = wrap_phase(context.intercept + int_delta)
+                        elseif !freeze_active
+                            if !fit_input_ok
+                                context.skip_fit_input_count += 1
+                            elseif fit_rms > context.max_fit_rms_on
+                                context.skip_fit_rms_count += 1
+                            else
+                                context.skip_gate_count += 1
+                            end
                         end
+                    else
+                        context.skip_invalid_fit_count += 1
+                    end
+                    if !update_applied && !freeze_active && context.force_update_eps > 0.0
+                        eps = isodd(context.symbol_index) ? context.force_update_eps : -context.force_update_eps
+                        context.slope += eps
+                        context.intercept = wrap_phase(context.intercept + eps)
+                        update_applied = true
+                        force_update_applied = true
+                        context.force_update_count += 1
                     end
                     if context.log_stats
                         now = time()
@@ -504,7 +546,15 @@ function task!(context::ISDBTPhaseSlopeCorrectorContext)
                                         " used=", used, "/", n,
                                         " used_gate_min=", used_gate_min,
                                         " gate=", context.update_enabled,
-                                        " updated=", update_applied)
+                                        " updated=", update_applied,
+                                        " skip_freeze=", context.skip_freeze_count,
+                                        " skip_gate=", context.skip_gate_count,
+                                        " skip_fit_input=", context.skip_fit_input_count,
+                                        " skip_fit_rms=", context.skip_fit_rms_count,
+                                        " skip_small_delta=", context.skip_small_delta_count,
+                                        " skip_invalid_fit=", context.skip_invalid_fit_count,
+                                        " force_update=", force_update_applied,
+                                        " force_count=", context.force_update_count)
                             end
                             context.last_log_time = now
                         end

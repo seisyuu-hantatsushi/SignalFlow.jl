@@ -2291,3 +2291,974 @@
 
 ## Known issues
 - None specific to this change; CLI override remains available for stress testing.
+
+## Current progress status
+- Compiled current milestone-3 (SP phase stabilization) issues after milestone-2 completion.
+- Prioritized remaining M3 work items for next implementation step.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded M3 issue-status reporting per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. PilotEQ temporal stabilization under disturbed/low-SNR windows (verify coefficient jitter reduction beyond stable-condition logs).
+2. PhaseSlope gate retuning for responsiveness vs over-gating under disturbance (`min_used_pilots/min_used_ratio` and hysteresis balance).
+3. CPE confidence-ramp validation in real low-confidence region (`conf < min_update_conf_on`) and adjustment of `conf_gain_floor` / ramp shape.
+4. Stage-to-stage consistency check (PilotEQ -> PhaseSlope -> CPE) using correlated telemetry (`updated/gate/conf`) and EVM trend.
+
+## Known issues
+- Existing CPE validation logs were dominated by `conf=1.0`, so low-confidence suppression behavior is still not proven.
+- PhaseSlope often remained near-zero update in prior stable runs, leaving disturbed-condition responsiveness as an open risk.
+
+## Current progress status
+- Prepared a concrete low-SNR validation plan for milestone-3 item 1 (PilotEQ temporal stabilization).
+- Defined test matrix, metrics, pass criteria, and execution order to avoid mixing FrameSync effects with PilotEQ effects.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded M3 low-SNR validation planning task per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Baseline acquisition (fixed FrameSync operating point, no PilotEQ parameter change).
+2. PilotEQ alpha sweep under low-SNR (`alpha=0.1/0.2/0.3`) with identical capture duration.
+3. Metric extraction and comparison (`EVM`, `PhaseSlope/CPE update activity`, lock stability, seq continuity).
+4. Candidate selection and confirmation run.
+
+## Known issues
+- Current automated scripts focus on FrameSync lock metrics; PilotEQ-specific jitter metrics still require log parser extension or manual extraction.
+
+## Current progress status
+- Saved M3 low-SNR PilotEQ validation plan as a standalone markdown document under `docs/`.
+
+## Files changed and reasons for the changes
+- Added: `docs/m3_piloteq_lowsnr_validation_plan.md`
+  - Reason: documented the requested low-SNR test plan (objective, matrix, metrics, pass criteria, and execution order).
+- Updated: `HANDOVER.md`
+  - Reason: recorded plan-documentation task completion per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Execute baseline + alpha sweep according to the new plan.
+2. Summarize results into a comparison table and select candidate alpha.
+
+## Known issues
+- Plan is defined; execution/analysis artifacts are pending.
+
+## Current progress status
+- Created a dedicated summary document for work completed up to M1/M2 attainment.
+
+## Files changed and reasons for the changes
+- Added: `docs/m1_m2_achievement_summary.md`
+  - Reason: documented actions, fixes, evaluation flow, and final operating-point decision leading to M1/M2 completion.
+- Updated: `HANDOVER.md`
+  - Reason: recorded documentation task completion per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Continue M3 low-SNR PilotEQ validation using `docs/m3_piloteq_lowsnr_validation_plan.md`.
+2. Link M3 result summary doc after sweep execution.
+
+## Known issues
+- This task is documentation-only; no runtime behavior changed.
+
+## Current progress status
+- Split combined M1/M2 summary document into separate files as requested.
+
+## Files changed and reasons for the changes
+- Added: `docs/m1_achievement_summary.md`
+  - Reason: isolated M1 achievement history and outcomes.
+- Added: `docs/m2_achievement_summary.md`
+  - Reason: isolated M2 achievement history, boundary exploration, and operating-point finalization.
+- Deleted: `docs/m1_m2_achievement_summary.md`
+  - Reason: replaced by separate M1/M2 docs to avoid duplication/confusion.
+- Updated: `HANDOVER.md`
+  - Reason: recorded documentation split task completion per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Keep M3 docs separate in the same style (`plan` and `result`) after low-SNR sweep execution.
+
+## Known issues
+- None (documentation restructuring only).
+
+## Current progress status
+- Added executable sweep script for M3 low-SNR PilotEQ validation (`SNR x alpha` matrix).
+
+## Files changed and reasons for the changes
+- Added: `scripts/run_m3_piloteq_lowsnr_sweep.sh`
+  - Reason: automate planned M3-1 test matrix with reproducible FrameSync operating point and quick lock/sink summary.
+- Updated: `HANDOVER.md`
+  - Reason: recorded script implementation task completion per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Execute the new script and collect logs for `6/0/-2 dB` x `alpha=0.1/0.2/0.3`.
+2. Compare EVM and update-activity metrics to select candidate alpha.
+
+## Known issues
+- Script provides quick lock/sink summary only; detailed PilotEQ jitter/EVM analysis is still a follow-up step.
+
+## Current progress status
+- Evaluated first M3 low-SNR sweep run (`20260214_160733`) generated by `scripts/run_m3_piloteq_lowsnr_sweep.sh`.
+- All 9 conditions passed pipeline stability checks (`lock=1`, `unlock=0`, `forced/outlier=0`, `sink_fail=0`, graceful shutdown).
+- PilotEQ temporal metrics (`mean|H|`) differences across alpha (`0.1/0.2/0.3`) were small; no decisive winner from this run alone.
+- `PhaseSlope updated` and `CPE updated` remained zero in all runs, and `CPE conf` stayed `1.0`, so disturbance-driven adaptation was not exercised.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded M3 sweep evaluation outcome per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Increase stress and observability for M3 discrimination:
+   - extend SNR set to `0/-2/-4/-6 dB` and/or duration to `600 s`.
+   - enable EVM path during sweep for quality tie-break.
+2. Re-run selected alpha candidates with repeated runs to measure variance.
+
+## Known issues
+- Current sweep is stability-pass but not yet discriminative for alpha selection because adaptation paths were mostly idle.
+
+## Current progress status
+- Updated M3 low-SNR sweep script to support optional EVM logging so the extended 600s stress run can include a quality metric.
+
+## Files changed and reasons for the changes
+- Updated: `scripts/run_m3_piloteq_lowsnr_sweep.sh`
+  - Reason: added env-controlled EVM options (`M3_ENABLE_EVM`, `M3_EVM_MOD`, `M3_EVM_LOG_INTERVAL`) and command-array execution.
+- Updated: `HANDOVER.md`
+  - Reason: recorded script enhancement task completion per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Run extended sweep with `SNR=0/-2/-4/-6`, `duration=600s`, and EVM enabled.
+2. Evaluate logs for stability + EVM trend by alpha.
+
+## Known issues
+- EVM interpretation still depends on actual payload modulation (`qpsk/16qam/64qam`) selection.
+
+## Current progress status
+- Evaluated extended M3 low-SNR sweep with EVM enabled (`20260214_170229`, SNR `0/-2/-4/-6`, duration `600s`, alpha `0.1/0.2/0.3`).
+- Pipeline stability remained clean across all 12 runs (`unlock=0`, `forced/outlier=0`, `sink_fail=0`).
+- EVM-based comparison summary (run-mean EVM, lower is better):
+  - alpha=0.1: overall mean `137.62`, mean std `46.36`
+  - alpha=0.2: overall mean `145.05`, mean std `59.27`
+  - alpha=0.3: overall mean `146.19`, mean std `66.22`
+- By SNR, alpha=0.1 was best at `0/-4/-6 dB`; alpha=0.3 was slightly better at `-2 dB`.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded extended M3 sweep evaluation and alpha ranking per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Use `pilot_temporal_alpha=0.1` as provisional M3 baseline.
+2. Run confirmation repeat at `-2 dB` (where alpha preference crossed) to confirm robustness.
+3. Investigate why `PhaseSlope/CPE updated` remain mostly idle under stress despite EVM variation.
+
+## Known issues
+- `CPE conf` stayed `1.0` and `PhaseSlope/CPE updated` stayed `false` in these runs, limiting adaptation-path discrimination.
+
+## Current progress status
+- Added tooling to close remaining M3 issues by running reproducibility re-checks and producing deterministic analysis output.
+
+## Files changed and reasons for the changes
+- Added: `scripts/run_m3_piloteq_recheck.sh`
+  - Reason: automate repeated A/B verification (default alpha `0.1` vs `0.3`) at a chosen SNR with EVM enabled.
+- Added: `scripts/analyze_m3_piloteq_logs.py`
+  - Reason: aggregate per-log metrics (`EVM`, `H`, lock/unlock, updated flags, sink_fail`) and alpha-level summary for selection decisions.
+- Updated: `HANDOVER.md`
+  - Reason: recorded remaining-issue closure tooling task per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Execute re-check at `-2 dB` (`repeats=3`) to resolve alpha crossover uncertainty.
+2. If alpha `0.1` remains stable winner or tie, freeze as M3 baseline.
+3. If crossover persists, add one more discriminator run at `-3 dB`.
+
+## Known issues
+- Adaptation-path activity (`PhaseSlope/CPE updated`) may still remain sparse; decision currently relies mostly on EVM + stability metrics.
+
+## Current progress status
+- Evaluated M3 reproducibility re-check at `AWGN=-2 dB` (`20260215_114612`, alpha `0.1` vs `0.3`, repeats=3).
+- All 6 runs were stable (`lock=1`, `unlock=0`, `forced/outlier=0`, `sink_fail=0`, graceful shutdown).
+- Re-check result:
+  - alpha `0.1`: evm_mean(avg)=`148.74`, std_across_runs=`17.87`
+  - alpha `0.3`: evm_mean(avg)=`142.25`, std_across_runs=`4.89`
+- Conclusion: at the previously ambiguous `-2 dB` point, alpha `0.3` is better and more reproducible.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded re-check evaluation and updated M3-1 provisional decision per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Decide M3-1 baseline policy:
+   - global low-SNR robustness priority: keep alpha `0.1`
+   - include `-2 dB` reproducibility priority: choose alpha `0.3`
+2. Optionally run one tie-break at `-3 dB` to define boundary behavior.
+
+## Known issues
+- `PhaseSlope/CPE updated` remained zero and `CPE conf=1.0`; adaptation-path discrimination is still limited to EVM/stability behavior.
+
+## Current progress status
+- Fixed M3-1 baseline policy to option 1 (overall low-SNR average priority): `pilot_temporal_alpha=0.1`.
+
+## Files changed and reasons for the changes
+- Updated: `examples/isdbt_demod.jl`
+  - Reason: changed default `pilot_temporal_alpha` from `0.2` to `0.1` to reflect chosen M3-1 baseline policy.
+- Updated: `HANDOVER.md`
+  - Reason: recorded baseline-policy fixation per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Run a short no-override check to confirm startup print shows `PilotEQ temporal_alpha: 0.1`.
+2. Proceed to M3 next issue (PhaseSlope gate responsiveness / adaptation path exercise).
+
+## Known issues
+- Adaptation-path activity remains sparse in previous logs (`PhaseSlope/CPE updated` mostly false).
+
+## Current progress status
+- Started M3 remaining-work implementation by exposing adaptation-gate controls via CLI and adding an adaptation-probe runner.
+
+## Files changed and reasons for the changes
+- Updated: `examples/isdbt_demod.jl`
+  - Reason: added CLI knobs for adaptation-path probing:
+    - `--slope-min-used-ratio`
+    - `--cpe-min-update-conf`
+    - `--cpe-min-update-conf-off`
+  - Reason: wired these values into `ISDBTPhaseSlopeCorrector` / `ISDBTCPECorrector` construction.
+- Added: `scripts/run_m3_adaptivity_probe.sh`
+  - Reason: A/B run script (`strict` vs `relaxed` gate profiles) to force/observe `PhaseSlope/CPE updated` behavior under low-SNR stress.
+- Updated: `HANDOVER.md`
+  - Reason: recorded M3-remaining implementation kickoff per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Run `run_m3_adaptivity_probe.sh` at `-4 dB` and compare `phase_up/cpe_up` + EVM.
+2. If relaxed profile improves EVM without unlock increase, fold part of settings into baseline.
+
+## Known issues
+- Local runtime parse check was limited by environment launcher-lockfile error; functional verification should be done on target runtime host.
+
+## Current progress status
+- Evaluated M3 adaptivity probe (`strict` vs `relaxed`) at `AWGN=-4 dB` (`20260215_145152`, alpha=0.1).
+- Result:
+  - strict: `evm_mean=145.08`, `evm_std=66.72`
+  - relaxed: `evm_mean=151.20`, `evm_std=94.90`
+  - both: `lock=1`, `unlock=0`, `forced/outlier=0`, `sink_fail=0`, `phase_up/cpe_up=0`, `conf_mean=1.0`
+- Conclusion: relaxing current gate thresholds did not improve quality and did not activate adaptation path; remaining bottleneck is likely outside current gate thresholds.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded adaptivity-probe evaluation and conclusion per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Keep strict profile as baseline (do not adopt relaxed gate settings).
+2. Add stronger disturbance dimensions beyond AWGN-only (e.g., phase jump / CFO perturbation) to force adaptation-path exercise.
+3. Instrument `PhaseSlope/CPE` with explicit skip-reason counters to identify why updates remain zero.
+
+## Known issues
+- `CPE conf` remains saturated at `1.0`, and `PhaseSlope/CPE updated` remain zero under tested conditions, limiting M3 closure confidence.
+
+## Current progress status
+- Implemented AWGN-external impairment injection path to force adaptation-path exercise (CFO + phase jump).
+
+## Files changed and reasons for the changes
+- Added: `src/CFOPhaseInjector.jl`
+  - Reason: new block to inject software impairments:
+    - continuous CFO rotation (`cfo_hz`)
+    - periodic phase jumps (`phase_jump_deg`, `phase_jump_interval_frames`)
+  - Reason: keeps SeqTrace continuity and supports periodic runtime stats logging.
+- Updated: `src/SignalFlow.jl`
+  - Reason: included `CFOPhaseInjector` module in package load path.
+- Updated: `examples/isdbt_demod.jl`
+  - Reason: added CLI options:
+    - `--impair-cfo-hz`
+    - `--impair-phase-jump-deg`
+    - `--impair-phase-jump-interval-frames`
+    - `--impair-log-interval`
+  - Reason: inserted optional impairment block into chain (`rfsrc/awgn -> impair -> sync`).
+  - Reason: startup prints now indicate impairment settings when enabled.
+- Updated: `HANDOVER.md`
+  - Reason: recorded impairment-path implementation per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Run M3 probe with impairment enabled and compare `phase_up/cpe_up` activation against AWGN-only baseline.
+2. Tune impairment strength to trigger updates without causing unlock.
+
+## Known issues
+- Runtime functional validation of new CLI path is pending on target environment (local launcher had lockfile restrictions in sandbox checks).
+
+## Current progress status
+- Extended `run_m3_adaptivity_probe.sh` to support CFO/phase-jump impairment injection during strict/relaxed A/B evaluation.
+
+## Files changed and reasons for the changes
+- Updated: `scripts/run_m3_adaptivity_probe.sh`
+  - Reason: added impairment env knobs and command wiring:
+    - `IMPAIR_CFO_HZ`
+    - `IMPAIR_PHASE_JUMP_DEG`
+    - `IMPAIR_PHASE_JUMP_INTERVAL_FRAMES`
+    - `IMPAIR_LOG_INTERVAL`
+  - Reason: keeps same script while enabling AWGN-external disturbance tests.
+- Updated: `HANDOVER.md`
+  - Reason: recorded impairment-probe script enhancement per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Run adaptivity probe with impairment enabled and compare `phase_up/cpe_up` activation and EVM shift.
+2. Decide whether impairment profile should be standardized for M3 validation.
+
+## Known issues
+- Need target-runtime validation logs to confirm impairment path actually increases update activity.
+
+## Current progress status
+- Evaluated impairment-enabled adaptivity probe (`20260215_154646`) with CFO/phase-jump (`120 Hz`, `12 deg`, interval `8 frames`) at `AWGN=-4 dB`.
+- Results:
+  - strict: `evm_mean=139.14`, `evm_std=36.01`
+  - relaxed: `evm_mean=153.83`, `evm_std=79.47`
+  - both: `lock=1`, `unlock=0`, `forced/outlier=0`, `sink_fail=0`, `phase_up/cpe_up=0`, `conf_mean=1.0`
+- Conclusion: even with added impairment, adaptation-path updates were not triggered; strict profile remains clearly better.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded impairment-probe evaluation outcome per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Add skip-reason counters in `PhaseSlope/CPE` logs (e.g., blocked by `min_step`, zero-fit residual, phase-selection freeze, confidence hysteresis state).
+2. Consider stronger/structured impairment (frame-synchronous phase jump >20 deg or CFO ramp) after counters are available.
+
+## Known issues
+- `PhaseSlope/CPE updated` remains zero even under current impairment profile; M3 closure is blocked on root-cause observability.
+
+## Current progress status
+- Implemented skip-reason observability for M3 adaptation-path debugging.
+- Added cumulative `skip_*` counters to PhaseSlope and CPE logs, and extended analysis script to surface these counters.
+
+## Files changed and reasons for the changes
+- Updated: `src/ISDBTPhaseSlopeCorrector.jl`
+  - Reason: added counters for non-update reasons:
+    - `skip_freeze`, `skip_gate`, `skip_fit_input`, `skip_fit_rms`, `skip_small_delta`, `skip_invalid_fit`.
+  - Reason: appended counters to periodic `PhaseSlope:` log output.
+- Updated: `src/ISDBTCPECorrector.jl`
+  - Reason: added counters for non-update reasons:
+    - `skip_freeze`, `skip_gate`, `skip_no_used`, `skip_small_err`, `skip_zero_delta`.
+  - Reason: appended counters to periodic `CPE:` log output.
+- Updated: `scripts/analyze_m3_piloteq_logs.py`
+  - Reason: parse and report latest skip counters in per-log table.
+- Updated: `HANDOVER.md`
+  - Reason: recorded observability enhancement task completion per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Re-run adaptivity probe (with impairment) and inspect skip-counter columns.
+2. Use dominant skip reasons to choose next implementation fix (e.g., phase estimator path vs gate thresholds).
+
+## Known issues
+- Historical logs produced before this change will show `skip_* = 0` because fields were not emitted.
+
+## Current progress status
+- Evaluated impairment probe with new skip counters (`20260215_194635`).
+- Dominant skip reasons were identified:
+  - PhaseSlope: `skip_small_delta` overwhelmingly dominant (`~4.4e5`), while `skip_gate` and `skip_fit_input` were near-zero.
+  - CPE: `skip_small_err` and `skip_zero_delta` overwhelmingly dominant (`~4.4e5`), with `skip_gate` near-zero.
+- Interpretation: update gate is not the bottleneck; effective phase/slope deltas are below minimum-step thresholds most of the time.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded skip-counter based root-cause identification for M3 per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Expose minimum-step knobs in CLI and reduce them for probe runs:
+   - PhaseSlope: `min_slope_step`, `min_intercept_step_deg`
+   - CPE: `min_phase_step_deg`
+2. Re-run impairment probe and confirm `phase_up/cpe_up` become non-zero without inducing unlock.
+
+## Known issues
+- Current settings keep adaptation-path updates effectively quantized to zero (`small step` dominated), blocking M3 closure.
+
+## Current progress status
+- Implemented next M3 step by exposing minimum-step quantization knobs and wiring them into adaptivity probe automation.
+
+## Files changed and reasons for the changes
+- Updated: `examples/isdbt_demod.jl`
+  - Reason: added new CLI knobs for adaptation quantization thresholds:
+    - `--slope-min-slope-step`
+    - `--slope-min-intercept-step-deg`
+    - `--cpe-min-phase-step-deg`
+  - Reason: connected these to `ISDBTPhaseSlopeCorrector` / `ISDBTCPECorrector` constructors and startup prints.
+- Updated: `scripts/run_m3_adaptivity_probe.sh`
+  - Reason: added strict/relaxed profile controls for min-step knobs via env vars and passed them to demod CLI.
+- Updated: `HANDOVER.md`
+  - Reason: recorded this M3 implementation step per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Run adaptivity probe with reduced min-step values in relaxed profile and verify `phase_up/cpe_up > 0`.
+2. If updates appear without unlock increase, tune toward minimum EVM while keeping stability.
+
+## Known issues
+- Final validation depends on runtime logs from target SDR host.
+
+## Current progress status
+- Evaluated adaptivity probe run `20260216_212526` with impairment + min-step tuning profile.
+- Outcome:
+  - `relaxed` improved EVM vs `strict` in this run (`133.36` vs `158.66`).
+  - Pipeline stability remained good (`lock=1`, `unlock=0`, `sink_fail=0`).
+  - However adaptation updates still did not trigger (`phase_up/cpe_up=0`).
+- Skip counters remain dominated by small-step/zero-delta reasons:
+  - PhaseSlope: `skip_small_delta` dominant.
+  - CPE: `skip_small_err` and `skip_zero_delta` dominant.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded latest adaptivity-probe evaluation and implications per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Re-run strict/relaxed with repeats (>=3) to confirm whether relaxed EVM gain is reproducible or single-run variance.
+2. If reproducible, keep relaxed min-step settings for M3 provisional baseline.
+3. To trigger non-zero updates, either lower min-step further (one order) or move impairment injection point downstream (post-FFT/pilot path).
+
+## Known issues
+- Despite impairment and threshold tuning, `updated` remains zero; M3 closure still blocked on adaptation-path activation evidence.
+
+## Current progress status
+- Extended adaptivity probe runner to support repeated strict/relaxed A/B runs in one command.
+
+## Files changed and reasons for the changes
+- Updated: `scripts/run_m3_adaptivity_probe.sh`
+  - Reason: added optional `repeats` argument (`5th` positional), per-repeat log suffix (`rN`), and looped execution for reproducibility checks.
+- Updated: `HANDOVER.md`
+  - Reason: recorded repeat-run automation update per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Execute probe with `repeats=3` and compare strict/relaxed reproducibility.
+2. Decide provisional M3 profile from repeated-run aggregate metrics.
+
+## Known issues
+- Increased run count means long total runtime (`duration * repeats * 2`).
+
+## Current progress status
+- Evaluated repeated adaptivity probe (`20260217_212234`, repeats=3 each profile) with impairment and min-step tuning.
+- Aggregated profile comparison from run means:
+  - relaxed EVM means: `145.53`, `145.55`, `153.00` -> avg `148.03`
+  - strict EVM means: `149.68`, `151.94`, `141.50` -> avg `147.71`
+- Difference between profiles is very small (`~0.32`), with no decisive winner.
+- Crucially, adaptation path still inactive in all 6 runs:
+  - `phase_up/cpe_up=0`
+  - skip counters dominated by small-step paths (`PhaseSlope skip_small_delta`, `CPE skip_small_err/skip_zero_delta`).
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded repeated strict/relaxed evaluation and conclusion per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Keep strict profile as default (difference is negligible; strict is current baseline).
+2. Add one more probe profile with 10x lower min-step thresholds to force non-zero updates:
+   - `slope-min-slope-step=1e-6`
+   - `slope-min-intercept-step-deg=0.02`
+   - `cpe-min-phase-step-deg=0.02`
+3. If updates still remain zero, shift impairment injection downstream (post-FFT/Pilot domain) for direct phase-path excitation.
+
+## Known issues
+- M3 remains blocked by lack of adaptation activation evidence; gate and confidence are not the limiting factors under current impairment model.
+
+## Current progress status
+- Evaluated further-reduced min-step probe (`20260217_223147`, repeats=2, strict vs relaxed with relaxed min-step at `1e-6/0.02/0.02`).
+- Result: adaptation path still inactive in all runs (`phase_up/cpe_up=0`).
+- Skip counters remain dominated by small-step paths (`PhaseSlope skip_small_delta`, `CPE skip_small_err/skip_zero_delta`).
+- Stability remained good (`unlock=0`, `sink_fail=0`).
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded latest probe outcome and decision basis per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Move impairment injection point downstream (post-FFT / pilot-domain path) to directly excite SP correction stages.
+2. Re-run strict/relaxed probe at same SNR and compare whether `phase_up/cpe_up` become non-zero.
+
+## Known issues
+- Even aggressive min-step lowering did not activate updates with current upstream impairment injection.
+
+## Current progress status
+- Implemented downstream impairment injection path (post-FFT) to directly excite SP correction stages for M3 debugging.
+
+## Files changed and reasons for the changes
+- Added: `src/OFDMSymbolImpairInjector.jl`
+  - Reason: new FFT-domain symbol impairment block supporting:
+    - symbol-domain CFO drift (`cfo_hz`),
+    - periodic phase jump (`phase_jump_deg`, `phase_jump_interval_frames`),
+    - phase slope across bins (`slope_rad_per_bin`).
+- Updated: `src/SignalFlow.jl`
+  - Reason: included `OFDMSymbolImpairInjector` module.
+- Updated: `examples/isdbt_demod.jl`
+  - Reason: added symbol-domain impairment CLI options:
+    - `--sym-impair-cfo-hz`
+    - `--sym-impair-phase-jump-deg`
+    - `--sym-impair-phase-jump-interval-frames`
+    - `--sym-impair-slope-rad-per-bin`
+    - `--sym-impair-log-interval`
+  - Reason: inserted optional `sym_impair` block after `fft_gain_block` and before pilot/TMCC paths.
+- Updated: `scripts/run_m3_adaptivity_probe.sh`
+  - Reason: added env-based symbol impairment wiring (`SYM_IMPAIR_*`) and CLI forwarding.
+- Updated: `HANDOVER.md`
+  - Reason: recorded downstream-injection implementation per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Run adaptivity probe with `SYM_IMPAIR_*` enabled and compare `phase_up/cpe_up` activation versus upstream-only impairment.
+2. If updates become non-zero, tune symbol-impair strength to maximize activation while preserving lock.
+
+## Known issues
+- Behavioral validation of new symbol-domain impairment path requires runtime logs from target SDR host.
+
+## Current progress status
+- Evaluated downstream (post-FFT) symbol impairment probe (`20260218_000154`, repeats=2) with:
+  - `SYM_IMPAIR_CFO_HZ=120`
+  - `SYM_IMPAIR_PHASE_JUMP_DEG=12`
+  - `SYM_IMPAIR_PHASE_JUMP_INTERVAL_FRAMES=8`
+  - `SYM_IMPAIR_SLOPE_RAD_PER_BIN=0.0002`
+- Outcome:
+  - stability remained good (`lock=1`, `unlock=0`, `sink_fail=0`) in all runs.
+  - `phase_up/cpe_up` still `0/0` in all runs.
+  - skip counters still dominated by small-step paths (`PhaseSlope skip_small_delta`, `CPE skip_small_err/skip_zero_delta`).
+- Conclusion: moving impairment to FFT-post path alone did not activate adaptation updates.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded downstream-impairment evaluation result and M3 blockage status per AGENTS.md rules.
+
+## Tasks to be addressed next
+1. Inject disturbance directly into pilot/reference phase domain (before PhaseSlope/CPE fit decisions), not only into generic symbol stream.
+2. Add explicit test mode in PhaseSlope/CPE for forced minimal update to validate update plumbing independently from fit thresholds.
+
+## Known issues
+- M3 remains blocked: adaptation path not activating despite upstream/downstream impairment and min-step relaxation.
+
+## Current progress status
+- Implemented request "2": added force-update CLI controls in `examples/isdbt_demod.jl` and wired them into `PhaseSlope`/`CPE` block constructors.
+- Startup log now prints configured force-update values for visibility.
+- Runtime check confirmed new options are parsed and reflected in startup output.
+
+## Files changed and reasons for the changes
+- Updated: `examples/isdbt_demod.jl`
+  - Added CLI args:
+    - `--slope-force-update-eps`
+    - `--cpe-force-update-eps-deg`
+  - Added validation:
+    - both must be `>= 0`
+  - Extended `parse_args` return tuple and `main()` destructuring.
+  - Passed values to constructors:
+    - `ISDBTPhaseSlopeCorrector.CreateISDBTPhaseSlopeCorrector(... force_update_eps=...)`
+    - `ISDBTCPECorrector.CreateISDBTCPECorrector(... force_update_eps_deg=...)`
+  - Added startup print line:
+    - `Phase/CPE force_update_eps: slope=... cpe_deg=...`
+
+## Tasks to be addressed next
+1. Complete CPE side forced-update execution path in `src/ISDBTCPECorrector.jl` task loop (currently parser/wiring exists, task-side force application/logging still pending).
+2. Add env forwarding in `scripts/run_m3_adaptivity_probe.sh` for strict/relaxed force-update knobs.
+3. Re-run adaptivity probe and confirm non-zero `phase_up/cpe_up` or explicit `force_update` counters.
+
+## Known issues
+- Current live run still shows repeated `ISDBTSymbolSync: sink_backpressure ... FFTBlock` under this environment.
+- CPE forced-update behavior is not yet verified end-to-end until task-side force-update logic is completed.
+
+## Current progress status
+- Continued from prior step and completed script wiring for strict/relaxed force-update controls.
+- `scripts/run_m3_adaptivity_probe.sh` now forwards force-update parameters to `examples/isdbt_demod.jl` in both profiles.
+- Syntax check passed (`bash -n`).
+
+## Files changed and reasons for the changes
+- Updated: `scripts/run_m3_adaptivity_probe.sh`
+  - Reason: added env knobs and CLI forwarding for force-update validation path:
+    - `STRICT_SLOPE_FORCE_UPDATE_EPS`
+    - `STRICT_CPE_FORCE_UPDATE_EPS_DEG`
+    - `RELAXED_SLOPE_FORCE_UPDATE_EPS`
+    - `RELAXED_CPE_FORCE_UPDATE_EPS_DEG`
+  - Reason: extended `run_one()` argument list so strict/relaxed values are passed explicitly.
+  - Reason: usage/help text updated to show new env variables.
+- Updated: `HANDOVER.md`
+  - Reason: recorded completed task per AGENTS.md requirement.
+
+## Tasks to be addressed next
+1. Run adaptivity probe with non-zero force-update settings and compare strict vs relaxed output logs.
+2. Verify logs include expected non-zero update evidence (`phase_up/cpe_up` and/or force-update counters).
+3. If still no activation, complete/verify CPE task-side force-update path in `src/ISDBTCPECorrector.jl`.
+
+## Known issues
+- This step only adds script/CLI plumbing; behavioral activation depends on runtime path in correction blocks.
+- CPE force-update runtime behavior still needs explicit confirmation in logs.
+
+## Current progress status
+- Evaluated force-update enabled M3 adaptivity probe (`20260218_225358`, SNR=-4dB, repeats=2).
+- Adaptation path is now active in both profiles:
+  - `phase_up/cpe_up` changed from `0/0` to non-zero (`20/17..19`).
+- Stream stability remained good (`lock=1`, `unlock=0`, `sink_fail=0`, `shutdown=1`).
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded latest runtime evaluation and conclusions per AGENTS.md requirement.
+
+## Tasks to be addressed next
+1. Use relaxed force-update settings as candidate operating point for debug-phase validation (better confidence and lower EVM spread than strict).
+2. Run A/B confirmation against force-update disabled baseline at same conditions (`SNR=-4dB`, repeats>=3).
+3. If relaxed remains better, proceed to reduce force-update magnitudes gradually toward minimal effective values.
+
+## Known issues
+- Strict profile shows large CPE gate skips (`cpe_skip gate` very high) and lower confidence (`conf_mean ~0.63-0.66`), with one high-EVM outlier run.
+- Force-update mode is diagnostic; final operating point should be re-validated with reduced/disabled force values.
+
+## Current progress status
+- Reported current milestone status and completion percentages based on latest validated logs and scripts.
+- Reflected latest force-update adaptivity result (`20260218_225358`) in milestone progress interpretation.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: logged completion of current status-reporting task per AGENTS.md rule.
+
+## Tasks to be addressed next
+1. Execute M3 A/B validation (force-update ON vs OFF) at `SNR=-4dB`, repeats>=3.
+2. If ON path remains superior, reduce force-update magnitudes stepwise to find minimum effective settings.
+3. Reconfirm performance on normal-SNR point after low-SNR tuning.
+
+## Known issues
+- M3 is functionally unblocked (updates now active with force-update), but final baseline is not fixed until ON/OFF and tapering validation completes.
+
+## Current progress status
+- Continued M3 remaining tasks by implementing missing CPE force-update runtime path and adding automation scripts for final validation steps.
+- Added two runnable workflows:
+  1. force-update `ON/OFF` A/B comparison at fixed conditions
+  2. force-update magnitude taper sweep toward minimum effective settings
+- Local compile/syntax checks passed (`using SignalFlow`, `bash -n` for new scripts).
+
+## Files changed and reasons for the changes
+- Updated: `src/ISDBTCPECorrector.jl`
+  - Reason: force-update parameters were previously plumbed but not applied in runtime.
+  - Added task-loop behavior:
+    - apply tiny signed phase step when `!updated && !freeze_active && force_update_eps>0`
+    - increment `force_update_count`
+    - set `updated=true` for the symbol
+  - Added log fields:
+    - `force_update=...`
+    - `force_count=...`
+- Added: `scripts/run_m3_force_ab.sh`
+  - Reason: automate M3 final A/B check (`force OFF` vs `force ON`) with repeated runs and analyzer output.
+- Added: `scripts/run_m3_force_taper.sh`
+  - Reason: automate force magnitude taper sweep to find minimal effective force settings.
+- Updated: `HANDOVER.md`
+  - Reason: recorded completed implementation and next actions per AGENTS.md requirements.
+
+## Tasks to be addressed next
+1. Run `run_m3_force_ab.sh` at `SNR=-4dB` with repeats>=3 and verify ON/OFF separation in `phase_up/cpe_up` and EVM consistency.
+2. Run `run_m3_force_taper.sh` with candidate force levels and choose minimum levels that preserve update activity and stability.
+3. Reconfirm selected setting at normal SNR (e.g., `6/12 dB`) to ensure no regression.
+
+## Known issues
+- Final M3 closure still depends on long runtime logs from target SDR host.
+- Force-update mode is diagnostic and should be minimized/disabled for final baseline once adaptation behavior is validated.
+
+## Current progress status
+- Evaluated M3 force A/B run (`20260219_223052`, profile=relaxed, SNR=-4dB, repeats=3, impairment enabled).
+- A/B separation is clear:
+  - force OFF: `phase_up/cpe_up = 0/0` (no adaptation updates)
+  - force ON: `phase_up/cpe_up = 20/20` (updates activated every logged interval)
+- Stability stayed intact in all runs (`lock=1`, `unlock=0`, `sink_fail=0`, `shutdown=1`).
+- Quality tradeoff observed: force ON significantly worsened EVM.
+  - OFF EVM mean(avg across runs): ~138.52
+  - ON  EVM mean(avg across runs): ~164.28
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded M3 A/B evaluation outcome and implications per AGENTS.md requirement.
+
+## Tasks to be addressed next
+1. Run force taper sweep with smaller force levels to find minimal effective update activation with lower EVM penalty.
+2. Prioritize reducing CPE force first (likely larger EVM impact), keeping slope force small for activation probing.
+3. Re-run selected candidate at repeats>=3 and compare against OFF baseline.
+
+## Known issues
+- Current ON setting (`slope=5e-6`, `cpe=0.05deg`) is too strong for quality and not suitable as final operating point.
+- OFF keeps better EVM but does not activate adaptation updates under this test condition.
+
+## Current progress status
+- Evaluated force taper sweep (`20260220_003812`, profile=relaxed, SNR=-4dB, repeats=2).
+- Stability remained good across all levels (`lock=1`, `unlock=0`, `sink_fail=0`, `shutdown=1`).
+- OFF baseline (`0:0`) still gives best quality but no adaptation updates:
+  - EVM mean avg: ~133.65, `phase_up/cpe_up=0/0`.
+- All non-zero force levels triggered updates (`phase_up/cpe_up=20/20`) but increased EVM.
+- Among tested non-zero levels, best EVM was:
+  - `slope=2e-6, cpe=0.01deg` (avg ~144.81)
+  - next: `slope=1e-6, cpe=0.005deg` (avg ~146.41)
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded taper sweep evaluation and narrowed candidates for M3 closure.
+
+## Tasks to be addressed next
+1. Re-run candidate levels with repeats>=3 for confidence:
+   - `2e-6:0.01`
+   - `1e-6:0.005`
+   - `0:0` baseline
+2. Add factor-isolation run to separate slope-force and cpe-force contributions:
+   - slope-only (`slope>0, cpe=0`)
+   - cpe-only (`slope=0, cpe>0`)
+3. Choose provisional M3 debug operating point minimizing EVM penalty while keeping `phase_up/cpe_up>0`.
+
+## Known issues
+- EVM impact is non-monotonic across tiny force levels; current repeats=2 is insufficient for final fixation.
+
+## Current progress status
+- Proceeding with M3 next step #1: planned reproducibility re-run for three candidate force levels with repeats>=3.
+- Prepared a single command using `run_m3_force_taper.sh` to execute:
+  - `2e-6:0.01`
+  - `1e-6:0.005`
+  - `0:0` (OFF baseline)
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded the selected next execution step and run conditions per AGENTS.md requirements.
+
+## Tasks to be addressed next
+1. Run the prepared 3-level reproducibility command (repeats=3).
+2. Compare EVM mean/variance and `phase_up/cpe_up` persistence across the three levels.
+3. Decide provisional M3 debug operating point from reproducibility results.
+
+## Known issues
+- This run is long (`600s * 3 levels * 3 repeats = 5400s`), so completion depends on SDR host runtime availability.
+
+## Current progress status
+- Answered user question about EVM value meaning/interpretation based on actual implementation (`ISDBTEVMMonitor`).
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: logged completion of explanatory task per AGENTS.md rule.
+
+## Tasks to be addressed next
+1. Continue M3 validation runs (force A/B and taper finalization).
+
+## Known issues
+- None newly identified in this explanatory step.
+
+## Current progress status
+- Provided concrete action plan to reduce EVM under current M3 conditions.
+- Plan prioritizes minimizing force-update side effects while preserving adaptation observability.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: logged completion of guidance task per AGENTS.md requirement.
+
+## Tasks to be addressed next
+1. Run slope-only / cpe-only factor isolation to identify dominant EVM degradation source.
+2. Re-run narrowed candidate force levels with repeats>=3 and choose minimal effective point.
+3. Validate selected point at normal SNR to ensure no regression.
+
+## Known issues
+- Current force settings that activate updates are still introducing notable EVM penalty.
+
+## Current progress status
+- Evaluated candidate reproducibility run (`20260220_212741`, profile=relaxed, SNR=-4dB, repeats=3) for:
+  - `2e-6:0.01`
+  - `1e-6:0.005`
+  - `0:0`
+- Stability stayed good for all candidates (`lock=1`, `unlock=0`, `sink_fail=0`, `shutdown=1`).
+- Reproducibility summary:
+  - `0:0` (OFF baseline):
+    - `phase_up/cpe_up=0/0` (no adaptation updates)
+    - EVM avg across runs: ~150.91
+  - `1e-6:0.005`:
+    - `phase_up/cpe_up=20/20` in all runs
+    - EVM avg across runs: ~146.06 (best among update-enabled candidates)
+  - `2e-6:0.01`:
+    - `phase_up/cpe_up=20/20` in all runs
+    - EVM avg across runs: ~152.74
+- Conclusion: `1e-6:0.005` is currently the best M3 debug operating point (updates active with smallest EVM penalty among tested ON candidates).
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded reproducibility-run evaluation and provisional operating-point decision.
+
+## Tasks to be addressed next
+1. Run factor-isolation tests to reduce EVM further:
+   - slope-only (`1e-6:0`)
+   - cpe-only (`0:0.005`)
+   - plus `0:0` baseline
+2. If one-sided force keeps updates with lower EVM, adopt it as new provisional M3 point.
+3. Recheck selected point at normal SNR (e.g., 6/12dB).
+
+## Known issues
+- OFF baseline (`0:0`) can still show high run-to-run EVM variance in this channel/impairment condition.
+- Update-enabled points still incur EVM cost; further reduction requires slope/CPE contribution split.
+
+## Current progress status
+- Proceeded to next M3 task: prepared factor-isolation validation to split EVM impact between slope-force and CPE-force.
+- Defined concrete run command set for three levels (`1e-6:0`, `0:0.005`, `0:0`) under same impairment/SNR conditions.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded progression to factor-isolation step and run plan per AGENTS.md requirements.
+
+## Tasks to be addressed next
+1. Execute factor-isolation run (repeats=3) with:
+   - slope-only: `1e-6:0`
+   - cpe-only: `0:0.005`
+   - baseline: `0:0`
+2. Compare EVM mean/variance and `phase_up/cpe_up` for each level.
+3. Decide whether slope-only or cpe-only can replace mixed force point (`1e-6:0.005`).
+
+## Known issues
+- Final decision remains data-dependent until factor-isolation logs are collected.
+
+## Current progress status
+- Evaluated factor-isolation run (`20260220_232405`, profile=relaxed, SNR=-4dB, repeats=3) for:
+  - slope-only: `1e-6:0`
+  - cpe-only: `0:0.005`
+  - baseline: `0:0`
+- Stability was preserved for all levels (`lock=1`, `unlock=0`, `sink_fail=0`, `shutdown=1`).
+- Group summary (EVM mean across runs):
+  - baseline `0:0` -> ~143.67 (`phase_up/cpe_up=0/0`)
+  - cpe-only `0:0.005` -> ~147.34 (`phase_up/cpe_up=0/20`)
+  - slope-only `1e-6:0` -> ~156.91 (`phase_up/cpe_up=20/19`)
+- Interpretation:
+  - CPE-only triggers updates with smaller EVM penalty than slope-only.
+  - Slope-only contributes larger EVM degradation (including outlier run).
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded factor-isolation outcome and updated M3 narrowing logic.
+
+## Tasks to be addressed next
+1. Run direct A/B for `cpe-only (0:0.005)` vs `baseline (0:0)` with repeats>=3 for decision confidence.
+2. If cpe-only remains near baseline and update activation is required, adopt cpe-only as M3 debug operating point.
+3. Keep slope-force disabled by default in debug operating point unless slope-update activation becomes mandatory.
+
+## Known issues
+- Run-to-run channel variance remains high; final operating-point decision should be based on same-batch A/B comparisons.
+
+## Current progress status
+- Evaluated direct A/B (`20260221_101726`, profile=relaxed, SNR=-4dB, repeats=3) between:
+  - cpe-only `0:0.005`
+  - baseline `0:0`
+- Stability remained good in all runs (`lock=1`, `unlock=0`, `sink_fail=0`, `shutdown=1`).
+- Decision metrics:
+  - cpe-only (`0:0.005`): EVM mean avg ~145.70, `phase_up/cpe_up=0/20` (consistent CPE updates)
+  - baseline (`0:0`): EVM mean avg ~151.30, `phase_up/cpe_up=0/0`
+- Conclusion: cpe-only outperformed baseline in this batch and preserves update activation.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded final A/B evaluation and provisional M3 debug operating-point decision.
+
+## Tasks to be addressed next
+1. Set provisional M3 debug operating point to cpe-only:
+   - `slope_force_update_eps=0`
+   - `cpe_force_update_eps_deg=0.005`
+2. Run confirmation at normal SNR points (e.g., 6dB and 12dB) to ensure no regression.
+3. If normal-SNR checks pass, mark M3 debug-phase closure and proceed to constellation stabilization/tmcc path goals.
+
+## Known issues
+- Channel variance is still present; keep periodic rechecks when RF condition changes.
+
+## Current progress status
+- Proceeded to next phase after M3 low-SNR decision by adding normal-SNR confirmation automation.
+- Added script to validate provisional M3 debug operating point across configurable normal SNR list.
+
+## Files changed and reasons for the changes
+- Added: `scripts/run_m3_operatingpoint_normalsnr.sh`
+  - Reason: automate confirmation runs at normal SNR (default 12/6 dB) for selected force settings.
+  - Supports env-configurable operating point:
+    - `FORCE_SLOPE_EPS` (default `0`)
+    - `FORCE_CPE_EPS_DEG` (default `0.005`)
+  - Forwards impairment knobs (`IMPAIR_*`, `SYM_IMPAIR_*`) and runs analyzer on collected logs.
+- Updated: `HANDOVER.md`
+  - Reason: recorded completion of this implementation step per AGENTS.md.
+
+## Tasks to be addressed next
+1. Run normal-SNR confirmation with provisional point (`slope=0`, `cpe=0.005`).
+2. Compare against baseline (`slope=0`, `cpe=0`) if needed for regression assessment.
+3. If stable and non-regressive, mark M3 debug-phase closure.
+
+## Known issues
+- Final decision still depends on runtime logs from target SDR environment.
+
+## Current progress status
+- Evaluated normal-SNR confirmation run (`20260221_143720`) for provisional M3 debug operating point:
+  - `profile=relaxed`
+  - `slope_force_update_eps=0`
+  - `cpe_force_update_eps_deg=0.005`
+  - SNR points: `12dB`, `6dB`, repeats=2
+- Results:
+  - Stability good in all runs (`lock=1`, `unlock=0`, `sink_fail=0`, `shutdown=1`).
+  - CPE updates stayed active (`phase_up/cpe_up=0/20`).
+  - EVM at normal SNR improved compared to low-SNR campaigns (overall avg ~139.41 across 12/6dB set).
+- Decision: provisional M3 debug operating point is validated on normal-SNR checkpoints.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: recorded normal-SNR validation outcome and milestone implication.
+
+## Tasks to be addressed next
+1. Optionally run baseline comparison at normal SNR (`cpe_force=0`) for formal regression table.
+2. If no regression concern remains, mark M3 debug-phase as complete and shift focus to constellation/TMCC end goals.
+
+## Known issues
+- Force-update remains a debug aid; production default decision should be revisited after final constellation/TMCC acceptance criteria are fixed.
+
+## Current progress status
+- Proceeded with next step #1 request: prepared baseline comparison run at normal SNR with force disabled.
+- Target comparison against current provisional debug point (`cpe_force=0.005`) is now explicitly defined.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: logged execution plan for normal-SNR baseline comparison per AGENTS.md.
+
+## Tasks to be addressed next
+1. Run normal-SNR baseline with `FORCE_CPE_EPS_DEG=0` and collect logs.
+2. Compare baseline vs provisional (`0.005`) on EVM mean/variance and lock stability.
+3. Finalize whether to keep or remove cpe-force in M3 debug operating point.
+
+## Known issues
+- Final decision remains pending until baseline logs are collected and compared.
+
+## Current progress status
+- Completed requested normal-SNR baseline comparison (`20260221_152743`) with force disabled:
+  - `FORCE_SLOPE_EPS=0`
+  - `FORCE_CPE_EPS_DEG=0`
+  - SNR `12/6 dB`, repeats=2
+- Compared against prior run (`20260221_143720`, `FORCE_CPE_EPS_DEG=0.005`).
+- Comparison summary:
+  - `cf=0.005`: EVM avg ~139.41, `phase_up/cpe_up=0/20`
+  - `cf=0`: EVM avg ~139.10, `phase_up/cpe_up=0/0`
+  - Stability equal in both (`lock=1`, `unlock=0`, `sink_fail=0`, `shutdown=1`).
+- Interpretation: quality at normal SNR is essentially equivalent, with tiny edge to `cf=0`; update activation is the only clear benefit of `cf=0.005`.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: logged baseline comparison result and decision basis per AGENTS.md.
+
+## Tasks to be addressed next
+1. Split operating policy:
+   - default (quality-first): `FORCE_CPE_EPS_DEG=0`
+   - debug/probing mode: `FORCE_CPE_EPS_DEG=0.005`
+2. If desired, document this policy in docs/HANDOVER milestone section.
+3. Continue toward constellation/TMCC acceptance checks.
+
+## Known issues
+- Run-to-run EVM spread remains high due to channel/impairment variability; use repeated runs for any final acceptance gate.
+
+## Current progress status
+- Reported current milestone status and completion percentages after normal-SNR baseline comparison.
+
+## Files changed and reasons for the changes
+- Updated: `HANDOVER.md`
+  - Reason: logged completion of milestone/progress reporting task per AGENTS.md.
+
+## Tasks to be addressed next
+1. If approved, formalize split policy (default quality mode vs debug mode) in docs.
+2. Move to constellation/TMCC acceptance-phase tasks.
+
+## Known issues
+- Final acceptance still needs explicit constellation/TMCC success criteria closure.
+
+## Current progress status
+- Continued M3 remaining tasks by formalizing operating policy and documentation.
+- Switched normal-SNR validation script default to quality-first mode (`FORCE_CPE_EPS_DEG=0`).
+- Added M3 achievement summary document under `docs/` with final findings and policy split.
+
+## Files changed and reasons for the changes
+- Updated: `scripts/run_m3_operatingpoint_normalsnr.sh`
+  - Reason: align default behavior with validated quality-first policy:
+    - default `FORCE_CPE_EPS_DEG` changed from `0.005` to `0`.
+- Added: `docs/m3_achievement_summary.md`
+  - Reason: capture M3 implementation/results and provisional operating policy (default vs debug mode).
+- Updated: `HANDOVER.md`
+  - Reason: recorded this completion step per AGENTS.md.
+
+## Tasks to be addressed next
+1. If approved, treat M3 as complete and move to constellation/TMCC acceptance phase.
+2. Optionally add a short pointer in higher-level docs to `docs/m3_achievement_summary.md`.
+
+## Known issues
+- Force-based debug mode remains intentionally non-default and should be enabled only for adaptivity probing.

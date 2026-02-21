@@ -2,6 +2,8 @@ import SignalFlow
 import SignalFlow.ADFMCOMMS2Src
 import SignalFlow.BandSNREstimator
 import SignalFlow.AWGNInjector
+import SignalFlow.CFOPhaseInjector
+import SignalFlow.OFDMSymbolImpairInjector
 import SignalFlow.ConstellationView
 import SignalFlow.BinPowerMonitor
 import SignalFlow.PilotCorrelationMonitor
@@ -79,7 +81,7 @@ function parse_args(args)
     pilot_offset0 = 1
     seg0_flip = false
     pilot_eq_only = false
-    pilot_temporal_alpha = 0.2
+    pilot_temporal_alpha = 0.1
     tmcc_dbpsk = false
     tmcc_sync_word = nothing
     extractor_free_run = false
@@ -98,8 +100,25 @@ function parse_args(args)
     evm_log_interval = 10.0
     awgn_snr_db = nothing
     awgn_log_interval = 10.0
+    impair_cfo_hz = 0.0
+    impair_phase_jump_deg = 0.0
+    impair_phase_jump_interval_frames = 0
+    impair_log_interval = 10.0
+    sym_impair_cfo_hz = 0.0
+    sym_impair_phase_jump_deg = 0.0
+    sym_impair_phase_jump_interval_frames = 0
+    sym_impair_slope_rad_per_bin = 0.0
+    sym_impair_log_interval = 10.0
     framesync_unlock_threshold = 0.25
     framesync_unlock_confirm = 20
+    slope_min_used_ratio = 0.65
+    slope_min_slope_step = 7.5e-5
+    slope_min_intercept_step_deg = 0.4
+    slope_force_update_eps = 0.0
+    cpe_min_update_conf = 0.30
+    cpe_min_update_conf_off = 0.20
+    cpe_min_phase_step_deg = 0.4
+    cpe_force_update_eps_deg = 0.0
     i = 1
     while i <= length(args)
         a = args[i]
@@ -197,6 +216,42 @@ function parse_args(args)
             i += 1
             i > length(args) && error("Missing value for $a")
             awgn_log_interval = parse(Float64, args[i])
+        elseif a == "--impair-cfo-hz"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            impair_cfo_hz = parse(Float64, args[i])
+        elseif a == "--impair-phase-jump-deg"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            impair_phase_jump_deg = parse(Float64, args[i])
+        elseif a == "--impair-phase-jump-interval-frames"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            impair_phase_jump_interval_frames = parse(Int, args[i])
+        elseif a == "--impair-log-interval"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            impair_log_interval = parse(Float64, args[i])
+        elseif a == "--sym-impair-cfo-hz"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            sym_impair_cfo_hz = parse(Float64, args[i])
+        elseif a == "--sym-impair-phase-jump-deg"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            sym_impair_phase_jump_deg = parse(Float64, args[i])
+        elseif a == "--sym-impair-phase-jump-interval-frames"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            sym_impair_phase_jump_interval_frames = parse(Int, args[i])
+        elseif a == "--sym-impair-slope-rad-per-bin"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            sym_impair_slope_rad_per_bin = parse(Float64, args[i])
+        elseif a == "--sym-impair-log-interval"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            sym_impair_log_interval = parse(Float64, args[i])
         elseif a == "--framesync-unlock-threshold"
             i += 1
             i > length(args) && error("Missing value for $a")
@@ -205,6 +260,38 @@ function parse_args(args)
             i += 1
             i > length(args) && error("Missing value for $a")
             framesync_unlock_confirm = parse(Int, args[i])
+        elseif a == "--slope-min-used-ratio"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            slope_min_used_ratio = parse(Float64, args[i])
+        elseif a == "--slope-min-slope-step"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            slope_min_slope_step = parse(Float64, args[i])
+        elseif a == "--slope-min-intercept-step-deg"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            slope_min_intercept_step_deg = parse(Float64, args[i])
+        elseif a == "--slope-force-update-eps"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            slope_force_update_eps = parse(Float64, args[i])
+        elseif a == "--cpe-min-update-conf"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            cpe_min_update_conf = parse(Float64, args[i])
+        elseif a == "--cpe-min-update-conf-off"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            cpe_min_update_conf_off = parse(Float64, args[i])
+        elseif a == "--cpe-min-phase-step-deg"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            cpe_min_phase_step_deg = parse(Float64, args[i])
+        elseif a == "--cpe-force-update-eps-deg"
+            i += 1
+            i > length(args) && error("Missing value for $a")
+            cpe_force_update_eps_deg = parse(Float64, args[i])
         else
             error("Unknown argument: $a")
         end
@@ -218,15 +305,32 @@ function parse_args(args)
     seq_trace_log_interval < 1 && error("--seq-trace-log-interval must be >= 1")
     evm_log_interval <= 0 && error("--evm-log-interval must be > 0")
     awgn_log_interval <= 0 && error("--awgn-log-interval must be > 0")
+    impair_log_interval <= 0 && error("--impair-log-interval must be > 0")
+    sym_impair_log_interval <= 0 && error("--sym-impair-log-interval must be > 0")
+    impair_phase_jump_interval_frames < 0 && error("--impair-phase-jump-interval-frames must be >= 0")
+    sym_impair_phase_jump_interval_frames < 0 && error("--sym-impair-phase-jump-interval-frames must be >= 0")
     framesync_unlock_threshold <= 0 && error("--framesync-unlock-threshold must be > 0")
     framesync_unlock_confirm < 1 && error("--framesync-unlock-confirm must be >= 1")
+    (0.0 < slope_min_used_ratio <= 1.0) || error("--slope-min-used-ratio must be in (0, 1].")
+    slope_min_slope_step < 0 && error("--slope-min-slope-step must be >= 0")
+    slope_min_intercept_step_deg < 0 && error("--slope-min-intercept-step-deg must be >= 0")
+    slope_force_update_eps < 0 && error("--slope-force-update-eps must be >= 0")
+    (0.0 <= cpe_min_update_conf_off <= cpe_min_update_conf <= 1.0) ||
+        error("--cpe-min-update-conf-off / --cpe-min-update-conf must satisfy 0 <= off <= on <= 1.")
+    cpe_min_phase_step_deg < 0 && error("--cpe-min-phase-step-deg must be >= 0")
+    cpe_force_update_eps_deg < 0 && error("--cpe-force-update-eps-deg must be >= 0")
     !(evm_mod in ("qpsk", "16qam", "64qam")) &&
         error("--evm-mod must be one of qpsk/16qam/64qam")
     awgn_snr_db !== nothing && !isfinite(awgn_snr_db) &&
         error("--awgn-snr-db must be finite")
+    !isfinite(impair_cfo_hz) && error("--impair-cfo-hz must be finite")
+    !isfinite(impair_phase_jump_deg) && error("--impair-phase-jump-deg must be finite")
+    !isfinite(sym_impair_cfo_hz) && error("--sym-impair-cfo-hz must be finite")
+    !isfinite(sym_impair_phase_jump_deg) && error("--sym-impair-phase-jump-deg must be finite")
+    !isfinite(sym_impair_slope_rad_per_bin) && error("--sym-impair-slope-rad-per-bin must be finite")
     (pilot_temporal_alpha < 0 || pilot_temporal_alpha > 1) &&
         error("--pilot-temporal-alpha must be in [0, 1]")
-    return carrier, uri, diag, show_const, show_fft, show_wave, show_sync, show_pilots, fft_gain, pilot_offset0, seg0_flip, pilot_eq_only, pilot_temporal_alpha, tmcc_dbpsk, tmcc_sync_word, extractor_free_run, no_cpe, no_slope, src_poolsize, src_dispatch_burst, src_drop_backpressure, const_update_interval, const_drop_log_interval, seq_trace, seq_trace_log_interval, seq_trace_stage, evm, evm_mod, evm_log_interval, awgn_snr_db, awgn_log_interval, framesync_unlock_threshold, framesync_unlock_confirm
+    return carrier, uri, diag, show_const, show_fft, show_wave, show_sync, show_pilots, fft_gain, pilot_offset0, seg0_flip, pilot_eq_only, pilot_temporal_alpha, tmcc_dbpsk, tmcc_sync_word, extractor_free_run, no_cpe, no_slope, src_poolsize, src_dispatch_burst, src_drop_backpressure, const_update_interval, const_drop_log_interval, seq_trace, seq_trace_log_interval, seq_trace_stage, evm, evm_mod, evm_log_interval, awgn_snr_db, awgn_log_interval, impair_cfo_hz, impair_phase_jump_deg, impair_phase_jump_interval_frames, impair_log_interval, sym_impair_cfo_hz, sym_impair_phase_jump_deg, sym_impair_phase_jump_interval_frames, sym_impair_slope_rad_per_bin, sym_impair_log_interval, framesync_unlock_threshold, framesync_unlock_confirm, slope_min_used_ratio, slope_min_slope_step, slope_min_intercept_step_deg, slope_force_update_eps, cpe_min_update_conf, cpe_min_update_conf_off, cpe_min_phase_step_deg, cpe_force_update_eps_deg
 end
 
 using ADFMCOMMS2
@@ -241,7 +345,7 @@ end
 function main()
     prev_exit_on_sigint = Base.exit_on_sigint(false)
     restore_exit_on_sigint = prev_exit_on_sigint isa Bool
-    carrier, uri, diag, show_const, show_fft, show_wave, show_sync, show_pilots, fft_gain, pilot_offset0, seg0_flip, pilot_eq_only, pilot_temporal_alpha, tmcc_dbpsk, tmcc_sync_word, extractor_free_run, no_cpe, no_slope, src_poolsize, src_dispatch_burst, src_drop_backpressure, const_update_interval, const_drop_log_interval, seq_trace, seq_trace_log_interval, seq_trace_stage, evm, evm_mod, evm_log_interval, awgn_snr_db, awgn_log_interval, framesync_unlock_threshold, framesync_unlock_confirm = parse_args(ARGS)
+    carrier, uri, diag, show_const, show_fft, show_wave, show_sync, show_pilots, fft_gain, pilot_offset0, seg0_flip, pilot_eq_only, pilot_temporal_alpha, tmcc_dbpsk, tmcc_sync_word, extractor_free_run, no_cpe, no_slope, src_poolsize, src_dispatch_burst, src_drop_backpressure, const_update_interval, const_drop_log_interval, seq_trace, seq_trace_log_interval, seq_trace_stage, evm, evm_mod, evm_log_interval, awgn_snr_db, awgn_log_interval, impair_cfo_hz, impair_phase_jump_deg, impair_phase_jump_interval_frames, impair_log_interval, sym_impair_cfo_hz, sym_impair_phase_jump_deg, sym_impair_phase_jump_interval_frames, sym_impair_slope_rad_per_bin, sym_impair_log_interval, framesync_unlock_threshold, framesync_unlock_confirm, slope_min_used_ratio, slope_min_slope_step, slope_min_intercept_step_deg, slope_force_update_eps, cpe_min_update_conf, cpe_min_update_conf_off, cpe_min_phase_step_deg, cpe_force_update_eps_deg = parse_args(ARGS)
     # Miss-only logging to avoid adding load from OK logs.
     SignalFlow.SeqTrace.configure!(enabled = seq_trace,
                                    log_interval = seq_trace_log_interval,
@@ -268,8 +372,29 @@ function main()
     evm && println("EVM monitor: mod=", evm_mod, " interval=", round(evm_log_interval, digits = 2), "s")
     awgn_snr_db !== nothing && println("AWGNInjector enabled: snr_db=", round(awgn_snr_db, digits = 2),
                                        " log_interval=", round(awgn_log_interval, digits = 2), "s")
+    enable_impair = (impair_cfo_hz != 0.0) || (impair_phase_jump_deg != 0.0 && impair_phase_jump_interval_frames > 0)
+    enable_impair && println("CFO/Phase impairment enabled: cfo_hz=", round(impair_cfo_hz, digits = 2),
+                             " phase_jump_deg=", round(impair_phase_jump_deg, digits = 2),
+                             " interval_frames=", impair_phase_jump_interval_frames,
+                             " log_interval=", round(impair_log_interval, digits = 2), "s")
+    enable_sym_impair = (sym_impair_cfo_hz != 0.0) ||
+                        (sym_impair_phase_jump_deg != 0.0 && sym_impair_phase_jump_interval_frames > 0) ||
+                        (sym_impair_slope_rad_per_bin != 0.0)
+    enable_sym_impair && println("Symbol impairment enabled: cfo_hz=", round(sym_impair_cfo_hz, digits = 2),
+                                 " phase_jump_deg=", round(sym_impair_phase_jump_deg, digits = 2),
+                                 " interval_frames=", sym_impair_phase_jump_interval_frames,
+                                 " slope_rad_per_bin=", round(sym_impair_slope_rad_per_bin, digits = 6),
+                                 " log_interval=", round(sym_impair_log_interval, digits = 2), "s")
     println("FrameSync unlock_threshold: ", round(framesync_unlock_threshold, digits = 3),
             " unlock_confirm: ", framesync_unlock_confirm)
+    println("PhaseSlope min_used_ratio: ", round(slope_min_used_ratio, digits = 3),
+            " CPE min_update_conf(on/off): ", round(cpe_min_update_conf, digits = 3), "/",
+            round(cpe_min_update_conf_off, digits = 3))
+    println("Phase/CPE min_step: slope=", round(slope_min_slope_step, digits = 7),
+            " intercept_deg=", round(slope_min_intercept_step_deg, digits = 3),
+            " cpe_phase_deg=", round(cpe_min_phase_step_deg, digits = 3))
+    println("Phase/CPE force_update_eps: slope=", round(slope_force_update_eps, digits = 8),
+            " cpe_deg=", round(cpe_force_update_eps_deg, digits = 5))
     println("OFDM params: nfft=", OFDM_NFFT, " cp=", OFDM_NCP,
             " frame_ms_expected=", round(ExpectedFrameMs, digits = 3))
     if pilot_eq_only
@@ -302,6 +427,34 @@ function main()
                                                poolsize = BlockPool)
     else
         awgn = nothing
+    end
+    if enable_impair
+        impair = CFOPhaseInjector.CreateCFOPhaseInjector(ComplexF32;
+                                                         frame_size = src_frame_size,
+                                                         sample_rate = ADC_SamplingRate,
+                                                         cfo_hz = impair_cfo_hz,
+                                                         phase_jump_deg = impair_phase_jump_deg,
+                                                         phase_jump_interval_frames = impair_phase_jump_interval_frames,
+                                                         log_stats = true,
+                                                         log_interval = impair_log_interval,
+                                                         poolsize = BlockPool)
+    else
+        impair = nothing
+    end
+    if enable_sym_impair
+        sym_impair = OFDMSymbolImpairInjector.CreateOFDMSymbolImpairInjector(ComplexF32;
+                                                                              nfft = OFDM_NFFT,
+                                                                              sample_rate = ADC_SamplingRate,
+                                                                              ncp = OFDM_NCP,
+                                                                              cfo_hz = sym_impair_cfo_hz,
+                                                                              phase_jump_deg = sym_impair_phase_jump_deg,
+                                                                              phase_jump_interval_frames = sym_impair_phase_jump_interval_frames,
+                                                                              slope_rad_per_bin = sym_impair_slope_rad_per_bin,
+                                                                              log_stats = true,
+                                                                              log_interval = sym_impair_log_interval,
+                                                                              poolsize = BlockPool)
+    else
+        sym_impair = nothing
     end
 
     sync = ISDBTSymbolSync.CreateISDBTSymbolSync(; mode = 3,
@@ -446,11 +599,12 @@ function main()
                                                                         max_fit_rms = 0.30,
                                                                         max_fit_rms_off = 0.45,
                                                                         min_used_pilots = 24,
-                                                                        min_used_ratio = 0.65,
+                                                                        min_used_ratio = slope_min_used_ratio,
                                                                         update_confirm = 3,
                                                                         update_fail_confirm = 3,
-                                                                        min_slope_step = 7.5e-5,
-                                                                        min_intercept_step_deg = 0.4,
+                                                                        min_slope_step = slope_min_slope_step,
+                                                                        min_intercept_step_deg = slope_min_intercept_step_deg,
+                                                                        force_update_eps = slope_force_update_eps,
                                                                         auto_sp_phase = false,
                                                                         symbol_index_ref = frame_sync.symbol_index_ref,
                                                                         gap_freeze_ref = frame_sync.gap_freeze_ref,
@@ -474,12 +628,13 @@ function main()
                                                         pilot_min_mag = 0.2,
                                                         pilot_trim_ratio = 0.15,
                                                         # Keep gate stable under transient confidence dips.
-                                                        min_update_conf = 0.30,
-                                                        min_update_conf_off = 0.20,
+                                                        min_update_conf = cpe_min_update_conf,
+                                                        min_update_conf_off = cpe_min_update_conf_off,
                                                         conf_gain_floor = 0.05,
                                                         update_confirm = 3,
                                                         update_fail_confirm = 3,
-                                                        min_phase_step_deg = 0.4,
+                                                        min_phase_step_deg = cpe_min_phase_step_deg,
+                                                        force_update_eps_deg = cpe_force_update_eps_deg,
                                                         auto_sp_phase = false,
                                                         symbol_index_ref = frame_sync.symbol_index_ref,
                                                         gap_freeze_ref = frame_sync.gap_freeze_ref,
@@ -574,6 +729,10 @@ function main()
         connect_blocks!(rfsrc, awgn)
         sync_src = awgn
     end
+    if impair !== nothing
+        connect_blocks!(sync_src, impair)
+        sync_src = impair
+    end
     if mon_sync !== nothing
         connect_blocks!(sync_src, mon_sync)
         connect_blocks!(mon_sync, sync)
@@ -606,24 +765,29 @@ function main()
     # heavy downstream branches.
     connect_blocks!(fft, frame_sync)
     connect_blocks!(fft, fft_gain_block)
-    connect_blocks!(fft_gain_block, tmcc_power)
-    connect_blocks!(fft_gain_block, tmcc_power_flip)
-    connect_blocks!(fft_gain_block, pilot_corr)
+    fft_post = fft_gain_block
+    if sym_impair !== nothing
+        connect_blocks!(fft_gain_block, sym_impair)
+        fft_post = sym_impair
+    end
+    connect_blocks!(fft_post, tmcc_power)
+    connect_blocks!(fft_post, tmcc_power_flip)
+    connect_blocks!(fft_post, pilot_corr)
     if diag
         stats_fft = SignalStatsMonitor.CreateSignalStatsMonitor(; frame_size = OFDM_NFFT,
                                                                 label = "FFT out",
                                                                 log_interval = diag_log_interval,
                                                                 poolsize = StatsMonitorPool)
-        connect_blocks!(fft_gain_block, stats_fft)
+        connect_blocks!(fft_post, stats_fft)
     end
     if fft_view !== nothing
-        connect_blocks!(fft_gain_block, fft_view)
+        connect_blocks!(fft_post, fft_view)
     end
     if mon_pilot !== nothing
-        connect_blocks!(fft_gain_block, mon_pilot)
+        connect_blocks!(fft_post, mon_pilot)
         connect_blocks!(mon_pilot, pilot_eq)
     else
-        connect_blocks!(fft_gain_block, pilot_eq)
+        connect_blocks!(fft_post, pilot_eq)
     end
     if diag
         stats_piloteq = SignalStatsMonitor.CreateSignalStatsMonitor(; frame_size = OFDM_NFFT,

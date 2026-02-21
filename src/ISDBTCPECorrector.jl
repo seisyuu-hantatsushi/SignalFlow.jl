@@ -29,6 +29,7 @@ mutable struct ISDBTCPECorrectorContext <: SignalFlowBlock
     update_confirm::Int
     update_fail_confirm::Int
     min_phase_step::Float64
+    force_update_eps::Float64
     update_enabled::Bool
     conf_pass_count::Int
     conf_fail_count::Int
@@ -58,6 +59,12 @@ mutable struct ISDBTCPECorrectorContext <: SignalFlowBlock
     ringbuffer::RingFrameBuffer{ComplexF32}
     holdbuf::Union{Nothing, Int}
     input_overrun_count::Int
+    skip_freeze_count::UInt64
+    skip_gate_count::UInt64
+    skip_no_used_count::UInt64
+    skip_small_err_count::UInt64
+    skip_zero_delta_count::UInt64
+    force_update_count::UInt64
     worker::Union{Nothing,Task}
     new_sinks::Channel{SignalFlowBlock}
     sinks::Vector{SignalFlowBlock}
@@ -152,6 +159,7 @@ function CreateISDBTCPECorrector(; nfft::Int = 8192,
                                  update_confirm::Int = 2,
                                  update_fail_confirm::Int = 2,
                                  min_phase_step_deg::Real = 0.25,
+                                 force_update_eps_deg::Real = 0.0,
                                  cfo_alpha::Real = 0.1,
                                  auto_sp_phase::Bool = true,
                                  auto_sp_phase_interval::Int = 4,
@@ -171,6 +179,7 @@ function CreateISDBTCPECorrector(; nfft::Int = 8192,
     update_confirm < 1 && error("ISDBTCPECorrector: update_confirm must be >= 1.")
     update_fail_confirm < 1 && error("ISDBTCPECorrector: update_fail_confirm must be >= 1.")
     min_phase_step_deg < 0 && error("ISDBTCPECorrector: min_phase_step_deg must be >= 0.")
+    force_update_eps_deg < 0 && error("ISDBTCPECorrector: force_update_eps_deg must be >= 0.")
     (0.0 < cfo_alpha <= 1.0) || error("ISDBTCPECorrector: cfo_alpha must be in (0, 1].")
     auto_sp_phase_interval < 1 && error("ISDBTCPECorrector: auto_sp_phase_interval must be >= 1.")
     poolsize < 1 && error("ISDBTCPECorrector: poolsize must be at least 1.")
@@ -220,6 +229,7 @@ function CreateISDBTCPECorrector(; nfft::Int = 8192,
                                    update_confirm,
                                    update_fail_confirm,
                                    Float64(min_phase_step_deg) * Float64(pi) / 180.0,
+                                   Float64(force_update_eps_deg) * Float64(pi) / 180.0,
                                    false,
                                    0,
                                    0,
@@ -249,6 +259,12 @@ function CreateISDBTCPECorrector(; nfft::Int = 8192,
                                    RingFrameBuffer(ComplexF32, nfft, poolsize),
                                    nothing,
                                    0,
+                                   UInt64(0),
+                                   UInt64(0),
+                                   UInt64(0),
+                                   UInt64(0),
+                                   UInt64(0),
+                                   UInt64(0),
                                    nothing,
                                    new_sinks,
                                    sinks)
@@ -333,9 +349,11 @@ function task!(context::ISDBTCPECorrectorContext)
                         context.prev_phi_valid = true
                     end
                     updated = false
+                    force_update_applied = false
                     conf_gain = 0.0
                     freeze_active = context.gap_freeze_ref !== nothing && context.gap_freeze_ref[] > 0
                     if freeze_active
+                        context.skip_freeze_count += 1
                         context.update_enabled = false
                         context.conf_pass_count = 0
                         context.conf_fail_count = 0
@@ -391,6 +409,7 @@ function task!(context::ISDBTCPECorrectorContext)
                         end
                         err = wrap_phase(phi - context.cpe_phase)
                         if abs(err) < context.min_phase_step
+                            context.skip_small_err_count += 1
                             err = 0.0
                         end
                         # Confidence-linked update scaling:
@@ -411,9 +430,26 @@ function task!(context::ISDBTCPECorrectorContext)
                             delta = -context.cpe_max_step
                         end
                         updated = delta != 0.0
+                        !updated && (context.skip_zero_delta_count += 1)
                         context.cpe_phase = wrap_phase(context.cpe_phase + delta)
-                    elseif context.auto_sp_phase
-                        context.auto_phase_countdown = 0
+                    else
+                        if !freeze_active
+                            if used <= 0
+                                context.skip_no_used_count += 1
+                            elseif !context.update_enabled
+                                context.skip_gate_count += 1
+                            end
+                        end
+                        if context.auto_sp_phase
+                            context.auto_phase_countdown = 0
+                        end
+                    end
+                    if !updated && !freeze_active && context.force_update_eps > 0.0
+                        eps = isodd(context.symbol_index) ? context.force_update_eps : -context.force_update_eps
+                        context.cpe_phase = wrap_phase(context.cpe_phase + eps)
+                        updated = true
+                        force_update_applied = true
+                        context.force_update_count += 1
                     end
                     if context.log_stats
                         now = time()
@@ -446,7 +482,14 @@ function task!(context::ISDBTCPECorrectorContext)
                                         " fail=", context.conf_fail_count,
                                         " gate=", context.update_enabled,
                                         " conf_gain=", round(conf_gain, digits = 3),
-                                        " updated=", updated)
+                                        " updated=", updated,
+                                        " skip_freeze=", context.skip_freeze_count,
+                                        " skip_gate=", context.skip_gate_count,
+                                        " skip_no_used=", context.skip_no_used_count,
+                                        " skip_small_err=", context.skip_small_err_count,
+                                        " skip_zero_delta=", context.skip_zero_delta_count,
+                                        " force_update=", force_update_applied,
+                                        " force_count=", context.force_update_count)
                             end
                             context.last_log_time = now
                         end
